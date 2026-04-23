@@ -1,0 +1,44 @@
+[Unit]
+Description=Statix Agent
+Documentation=https://statix.pettersson.online/docs/nodes/manual-installation
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=STATIX_AGENT_CONFIG=/etc/statix/agent.json
+Environment=STATIX_VERSION_FILE=/opt/statix/version.json
+Environment=STATIX_APPLY_WIREGUARD=0
+EnvironmentFile=-/etc/statix/agent.env
+ExecStart=/usr/local/bin/statix run
+Restart=always
+RestartSec=5s
+KillSignal=SIGINT
+TimeoutStopSec=20s
+
+User=statix-agent
+Group=statix-agent
+
+# Run the main agent unprivileged; privileged actions should be delegated to narrow helpers.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=read-only
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectClock=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadOnlyPaths=/etc/statix /opt/statix
+RuntimeDirectory=statix-agent
+StateDirectory=statix-agent
+
+[Install]
+WantedBy=multi-user.target

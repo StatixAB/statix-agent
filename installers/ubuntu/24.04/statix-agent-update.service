@@ -1,0 +1,14 @@
+[Unit]
+Description=Update Statix Agent
+Documentation=https://statix.pettersson.online/docs/nodes/manual-installation
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=STATIX_AGENT_CONFIG=/etc/statix/agent.json
+Environment=STATIX_VERSION_FILE=/opt/statix/version.json
+EnvironmentFile=-/etc/statix/agent.env
+ExecStart=/usr/local/lib/statix/update.sh
+User=root
+Group=root
