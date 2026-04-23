@@ -26,7 +26,7 @@ jobs:
             linker: gcc
           - rust_target: aarch64-unknown-linux-gnu
             asset_arch: arm64
-            linker_package: gcc-aarch64-linux-gnu
+            linker_package: crossbuild-essential-arm64
             linker: aarch64-linux-gnu-gcc
 
     steps:
