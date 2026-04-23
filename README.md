@@ -13,13 +13,19 @@ The expected public release assets are:
 - `statix-agent-linux-amd64`
 - `statix-agent-linux-arm64`
 - matching `.sha256` files
-- installer assets for supported distributions
+- distro-specific installer assets for supported distributions, for example:
+- `statix-agent-install-ubuntu-24.04.sh`
+- `statix-agent-update-ubuntu-24.04.sh`
 
-The Ubuntu installer defaults to:
+The Ubuntu 24.04 installer assets should be published under:
 
 ```bash
 https://github.com/statixab/statix-agent/releases/latest/download
 ```
+
+Public docs or bootstrap scripts in the `statix` repo should select the correct
+installer asset for the target distribution instead of assuming a universal
+Linux `install.sh` or `update.sh`.
 
 ## Local build
 

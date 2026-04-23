@@ -5,6 +5,7 @@ readonly SERVICE_NAME="statix-agent"
 readonly SERVICE_USER="statix-agent"
 readonly SERVICE_GROUP="statix-agent"
 readonly DEFAULT_DOWNLOAD_BASE_URL="https://github.com/statixab/statix-agent/releases/latest/download"
+readonly UPDATE_SCRIPT_ASSET_NAME="statix-agent-update-ubuntu-24.04.sh"
 
 DOWNLOAD_BASE_URL="${STATIX_DOWNLOAD_BASE_URL:-$DEFAULT_DOWNLOAD_BASE_URL}"
 INSTALL_DIR="${STATIX_INSTALL_DIR:-/usr/local/bin}"
@@ -179,7 +180,7 @@ install_service_file() {
 
 install_update_script() {
   local update_url temporary update_dir
-  update_url="${STATIX_UPDATE_SCRIPT_URL:-$DOWNLOAD_BASE_URL/update.sh}"
+  update_url="${STATIX_UPDATE_SCRIPT_URL:-$DOWNLOAD_BASE_URL/$UPDATE_SCRIPT_ASSET_NAME}"
   update_dir="$(dirname "$UPDATE_SCRIPT_PATH")"
   temporary="$(mktemp)"
 
