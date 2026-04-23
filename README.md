@@ -32,3 +32,12 @@ Linux `install.sh` or `update.sh`.
 ```bash
 cargo build --release
 ```
+
+For release packaging, use:
+
+```bash
+bash scripts/build-release.sh all
+```
+
+This stages structured output under `dist/release/` and writes the flat GitHub
+release asset set under `dist/upload/`.

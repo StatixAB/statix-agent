@@ -46,26 +46,18 @@ jobs:
       - name: Build release binary
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.rust_target == 'aarch64-unknown-linux-gnu' && matrix.linker || '' }}
-        run: cargo build --locked --release --target ${{ matrix.rust_target }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        run: bash scripts/build-release.sh binary
 
       - name: Package release assets
-        env:
-          ASSET_ARCH: ${{ matrix.asset_arch }}
-          RUST_TARGET: ${{ matrix.rust_target }}
-        run: |
-          set -euo pipefail
-          release_dir="dist/${ASSET_ARCH}"
-          binary_path="target/${RUST_TARGET}/release/statix"
-
-          mkdir -p "${release_dir}"
-          install -m 0755 "${binary_path}" "${release_dir}/statix-agent-linux-${ASSET_ARCH}"
-          sha256sum "${release_dir}/statix-agent-linux-${ASSET_ARCH}" > "${release_dir}/statix-agent-linux-${ASSET_ARCH}.sha256"
+        run: find dist -maxdepth 4 -type f | sort
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: statix-agent-linux-${{ matrix.asset_arch }}
-          path: dist/${{ matrix.asset_arch }}/
+          path: dist/upload/
 
   publish-release:
     name: Publish release
@@ -80,31 +72,16 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: dist/upload
           merge-multiple: true
 
       - name: Generate shared release assets
         env:
           GIT_TAG: ${{ github.ref_name }}
           GIT_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-
-          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          cp installers/ubuntu/24.04/install.sh dist/statix-agent-install-ubuntu-24.04.sh
-          cp installers/ubuntu/24.04/update.sh dist/statix-agent-update-ubuntu-24.04.sh
-          cp installers/ubuntu/24.04/statix-agent.service dist/statix-agent.service
-          cp installers/ubuntu/24.04/statix-agent-update.service dist/statix-agent-update.service
-
-          cat > dist/version.json <<EOF
-          {
-            "version": "${GIT_TAG}",
-            "commit": "${GIT_SHA}",
-            "builtAt": "${built_at}"
-          }
-          EOF
+        run: bash scripts/build-release.sh shared
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: dist/upload/*
