@@ -1,0 +1,87 @@
+name: Build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset_arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust_target: x86_64-unknown-linux-gnu
+            asset_arch: amd64
+            linker_package: gcc
+            linker: gcc
+          - rust_target: aarch64-unknown-linux-gnu
+            asset_arch: arm64
+            linker_package: crossbuild-essential-arm64
+            linker: aarch64-linux-gnu-gcc
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.linker_package }}
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.rust_target == 'aarch64-unknown-linux-gnu' && matrix.linker || '' }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        run: bash scripts/build-release.sh binary
+
+      - name: Package release assets
+        run: find dist -maxdepth 4 -type f | sort
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: statix-agent-linux-${{ matrix.asset_arch }}
+          path: dist/upload/
+
+  publish-release:
+    name: Publish release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/upload
+          merge-multiple: true
+
+      - name: Generate shared release assets
+        env:
+          GIT_TAG: ${{ github.ref_name }}
+          GIT_SHA: ${{ github.sha }}
+        run: bash scripts/build-release.sh shared
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/upload/*
