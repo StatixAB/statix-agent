@@ -150,6 +150,19 @@ pub fn save_persisted_config(config: &PersistedAgentConfig) -> Result<PathBuf> {
 }
 
 pub fn agent_state_dir() -> Result<PathBuf> {
+    if let Some(path) = env_path("STATIX_AGENT_STATE_DIR") {
+        return Ok(path);
+    }
+
+    // systemd services with StateDirectory set expose this variable at runtime.
+    if let Some(path) = env_path("STATE_DIRECTORY") {
+        return Ok(path);
+    }
+
+    if let Some(path) = env_path("XDG_STATE_HOME") {
+        return Ok(path.join("statix"));
+    }
+
     let path = persisted_config_path()?;
     if let Some(parent) = path.parent() {
         return Ok(parent.to_path_buf());
@@ -212,6 +225,14 @@ fn parse_positive_int(name: &str, fallback: u64) -> u64 {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(fallback)
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn resolve_wireguard_config(persisted: Option<&PersistedAgentConfig>) -> Option<WireGuardConfig> {
