@@ -1,0 +1,3 @@
+defaults:
+  environment:
+    RUST_LOG: info

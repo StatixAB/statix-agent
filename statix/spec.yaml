@@ -1,0 +1,62 @@
+apiVersion: statix/v2
+kind: ProjectSpec
+
+metadata:
+  name: statix-agent
+  slug: statix-agent
+  owners:
+    - statix
+  labels:
+    language: rust
+    component: agent
+
+defaults:
+  runtime: microvm
+  shell: bash
+  timeoutSeconds: 1800
+  retryLimit: 0
+  environment:
+    CARGO_TERM_COLOR: always
+
+resources:
+  default:
+    executor: microvm
+    profile: standard
+
+setups:
+  cargo-deps:
+    description: Prepare the Rust dependency graph for test runs.
+    run:
+      - cargo
+      - fetch
+    cacheKey: cargo-lock-v1
+
+tasks:
+  test:
+    executor: microvm
+    execution:
+      environment:
+        type: microvm
+        image: ubuntu-24.04
+    command:
+      - cargo
+      - test
+    setup:
+      - cargo-deps
+    inputs:
+      sources:
+        - kind: workspace_path
+          path: .
+    constraints:
+      timeoutSeconds: 1800
+      resourceClass: default
+
+workflows:
+  ci:
+    - task: test
+
+deployments: {}
+
+policies:
+  concurrency:
+    mode: allow

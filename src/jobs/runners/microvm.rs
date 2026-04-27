@@ -1,6 +1,8 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, Command, Stdio};
+use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -18,6 +20,31 @@ pub struct MicrovmRunner {
     image: String,
     cpu: Option<u8>,
     memory_mb: Option<u32>,
+}
+
+struct QemuProcess {
+    child: Option<Child>,
+}
+
+impl QemuProcess {
+    async fn shutdown(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = child.kill();
+                log_qemu_exit_status(child.wait());
+            })
+            .await;
+        }
+    }
+}
+
+impl Drop for QemuProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            log_qemu_exit_status(child.wait());
+        }
+    }
 }
 
 impl MicrovmRunner {
@@ -81,8 +108,7 @@ impl Runner for MicrovmRunner {
             Err(error) => Err(error),
         };
 
-        let _ = qemu.kill().await;
-        let _ = qemu.wait().await;
+        qemu.shutdown().await;
 
         result
     }
@@ -263,9 +289,9 @@ async fn launch_qemu(
     cpu: u8,
     memory_mb: u32,
     ssh_port: u16,
-) -> Result<tokio::process::Child> {
+) -> Result<QemuProcess> {
     let binary = qemu_binary()?;
-    let mut command = TokioCommand::new(binary);
+    let mut command = Command::new(binary);
     command
         .arg("-m")
         .arg(memory_mb.to_string())
@@ -279,13 +305,62 @@ async fn launch_qemu(
         .arg(format!("user,id=net0,hostfwd=tcp::{}-:22", ssh_port))
         .arg("-device")
         .arg("virtio-net-pci,netdev=net0")
-        .arg("-nographic")
-        .kill_on_drop(true);
+        .arg("-nographic");
 
-    command.stdout(Stdio::null());
-    command.stderr(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
 
-    command.spawn().context("failed to launch qemu")
+    let mut child = command.spawn().context("failed to launch qemu")?;
+    spawn_qemu_log_stream("stdout", child.stdout.take());
+    spawn_qemu_log_stream("stderr", child.stderr.take());
+    Ok(QemuProcess { child: Some(child) })
+}
+
+fn spawn_qemu_log_stream(
+    label: &'static str,
+    stream: Option<impl std::io::Read + Send + 'static>,
+) {
+    let Some(stream) = stream else {
+        return;
+    };
+
+    thread::spawn(move || {
+        let reader = BufReader::new(stream);
+        for line in reader.lines() {
+            match line {
+                Ok(line) if verbose_logs_enabled() => {
+                    eprintln!("[statix-agent][debug] qemu {label}: {line}");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("[statix-agent] qemu {label} log read failed: {error}");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn log_qemu_exit_status(result: std::io::Result<std::process::ExitStatus>) {
+    match result {
+        Ok(status) if status.success() => {
+            if verbose_logs_enabled() {
+                eprintln!("[statix-agent][debug] qemu exited with status: {status}");
+            }
+        }
+        Ok(status) => eprintln!("[statix-agent] qemu exited with status: {status}"),
+        Err(error) => eprintln!("[statix-agent] failed to wait for qemu: {error}"),
+    }
+}
+
+fn verbose_logs_enabled() -> bool {
+    matches!(
+        std::env::var("STATIX_VERBOSE_LOGS")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 async fn wait_for_guest_ready(ssh_port: u16, timeout_seconds: u64) -> Result<()> {

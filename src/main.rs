@@ -6,6 +6,7 @@ mod system_info;
 mod wireguard;
 
 use std::{
+    collections::VecDeque,
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
     path::PathBuf,
@@ -21,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     select, signal,
     process::Command as TokioCommand,
-    sync::watch,
+    sync::{mpsc, watch},
     time::{MissedTickBehavior, interval},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -145,6 +146,24 @@ enum JobSource {
 
 enum SessionOutcome {
     Stopped,
+}
+
+#[derive(Debug)]
+enum OutboundMessage {
+    JobStatus {
+        job_id: String,
+        status: &'static str,
+        message: Option<String>,
+    },
+    Metrics(metrics::MetricsPayload),
+    SystemInfo(system_info::SystemInfoPayload),
+}
+
+#[derive(Debug)]
+struct CompletedJobStatus {
+    job_id: String,
+    status: &'static str,
+    message: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -304,20 +323,16 @@ async fn run_session(
     let mut last_system_info_hash: Option<String> = None;
     let mut last_system_info_published_at: Option<Instant> = None;
 
-    if let Err(error) = publish_metrics_once(&mut ws).await {
+    if let Err(error) = send_initial_metrics(&mut ws).await {
         eprintln!("[statix-agent] publish failed: {error:#}");
     }
 
-    if let Err(error) = publish_system_info_if_needed(
+    if let Err(error) = send_initial_system_info(
         &mut ws,
-        true,
         config.wireguard.as_ref(),
-        config.system_info_republish_interval_ms,
         &mut last_system_info_hash,
         &mut last_system_info_published_at,
-    )
-    .await
-    {
+    ).await {
         eprintln!("[statix-agent] system info publish failed: {error:#}");
     }
 
@@ -327,10 +342,84 @@ async fn run_session(
     system_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     publish_tick.tick().await;
     system_tick.tick().await;
+    let (mut ws_write, mut ws_read) = ws.split();
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
+    let (job_done_tx, mut job_done_rx) = mpsc::unbounded_channel::<CompletedJobStatus>();
+    tokio::spawn(async move {
+        while let Some(message) = outbound_rx.recv().await {
+            let send_result = match message {
+                OutboundMessage::JobStatus {
+                    job_id,
+                    status,
+                    message,
+                } => {
+                    send_client_message(
+                        &mut ws_write,
+                        &ClientMessage::JobStatus {
+                            job_id: &job_id,
+                            status,
+                            message: message.as_deref(),
+                        },
+                    )
+                    .await
+                }
+                OutboundMessage::Metrics(payload) => {
+                    send_client_message(&mut ws_write, &ClientMessage::Metrics { payload: &payload }).await
+                }
+                OutboundMessage::SystemInfo(payload) => {
+                    send_client_message(&mut ws_write, &ClientMessage::SystemInfo { payload: &payload }).await
+                }
+            };
+
+            if let Err(error) = send_result {
+                eprintln!("[statix-agent] outbound send failed: {error:#}");
+                break;
+            }
+        }
+    });
+    let mut queued_jobs: VecDeque<AgentJob> = VecDeque::new();
+    let mut active_job = false;
 
     loop {
+        if !active_job {
+            if let Some(job) = queued_jobs.pop_front() {
+                active_job = true;
+                let accepted = outbound_tx.send(OutboundMessage::JobStatus {
+                    job_id: job.id.clone(),
+                    status: "accepted",
+                    message: None,
+                });
+                let started = outbound_tx.send(OutboundMessage::JobStatus {
+                    job_id: job.id.clone(),
+                    status: "started",
+                    message: None,
+                });
+                if accepted.is_err() || started.is_err() {
+                    return Err(anyhow!("websocket writer is unavailable"));
+                }
+
+                let config = config.clone();
+                let job_done_tx = job_done_tx.clone();
+                tokio::spawn(async move {
+                    let completed = match execute_job(&config, &job).await {
+                        Ok(result) => CompletedJobStatus {
+                            job_id: job.id.clone(),
+                            status: result.status,
+                            message: result.message,
+                        },
+                        Err(error) => CompletedJobStatus {
+                            job_id: job.id.clone(),
+                            status: "failed",
+                            message: Some(format_error_chain(&error)),
+                        },
+                    };
+                    let _ = job_done_tx.send(completed);
+                });
+            }
+        }
+
         select! {
-            incoming = ws.next() => match incoming {
+            incoming = ws_read.next() => match incoming {
                 Some(Ok(Message::Text(text))) => {
                     match serde_json::from_str::<ServerMessage>(&text) {
                         Ok(ServerMessage::Error { error }) => {
@@ -342,57 +431,7 @@ async fn run_session(
                         Ok(ServerMessage::Job { job }) => {
                             log_verbose(&format!("received job {}", job.id));
                             let _issued_at = job.issued_at;
-                            let accepted = send_client_message(
-                                &mut ws,
-                                &ClientMessage::JobStatus {
-                                    job_id: &job.id,
-                                    status: "accepted",
-                                    message: None,
-                                },
-                            )
-                            .await;
-                            if accepted.is_err() {
-                                log_verbose(&format!("failed to send accepted status for job {}", job.id));
-                                continue;
-                            }
-
-                            let _ = send_client_message(
-                                &mut ws,
-                                &ClientMessage::JobStatus {
-                                    job_id: &job.id,
-                                    status: "started",
-                                    message: None,
-                                },
-                            )
-                            .await;
-
-                            match execute_job(config, &job).await {
-                                Ok(result) => {
-                                    log_verbose(&format!("job {} finished with status {}", job.id, result.status));
-                                    let _ = send_client_message(
-                                        &mut ws,
-                                        &ClientMessage::JobStatus {
-                                            job_id: &job.id,
-                                            status: result.status,
-                                            message: result.message.as_deref(),
-                                        },
-                                    )
-                                    .await;
-                                }
-                                Err(error) => {
-                                    let message = format_error_chain(&error);
-                                    log_verbose(&format!("job {} failed: {message}", job.id));
-                                    let _ = send_client_message(
-                                        &mut ws,
-                                        &ClientMessage::JobStatus {
-                                            job_id: &job.id,
-                                            status: "failed",
-                                            message: Some(&message),
-                                        },
-                                    )
-                                    .await;
-                                }
-                            }
+                            queued_jobs.push_back(job);
                         }
                         Err(_) => {
                             log_verbose(&format!(
@@ -421,13 +460,13 @@ async fn run_session(
                 }
             },
             _ = publish_tick.tick() => {
-                if let Err(error) = publish_metrics_once(&mut ws).await {
+                if let Err(error) = publish_metrics_once(&outbound_tx).await {
                     eprintln!("[statix-agent] publish failed: {error:#}");
                 }
             }
             _ = system_tick.tick() => {
                 if let Err(error) = publish_system_info_if_needed(
-                    &mut ws,
+                    &outbound_tx,
                     false,
                     config.wireguard.as_ref(),
                     config.system_info_republish_interval_ms,
@@ -437,9 +476,28 @@ async fn run_session(
                     eprintln!("[statix-agent] system info publish failed: {error:#}");
                 }
             }
+            completed = job_done_rx.recv() => {
+                let Some(completed) = completed else {
+                    return Err(anyhow!("job completion channel closed"));
+                };
+                active_job = false;
+                if completed.status == "failed" {
+                    if let Some(message) = completed.message.as_deref() {
+                        log_verbose(&format!("job {} failed: {message}", completed.job_id));
+                    }
+                } else {
+                    log_verbose(&format!("job {} finished with status {}", completed.job_id, completed.status));
+                }
+                if outbound_tx.send(OutboundMessage::JobStatus {
+                    job_id: completed.job_id,
+                    status: completed.status,
+                    message: completed.message,
+                }).is_err() {
+                    return Err(anyhow!("websocket writer is unavailable"));
+                }
+            }
             changed = stop_rx.changed() => {
                 if changed.is_ok() && *stop_rx.borrow() {
-                    let _ = ws.close(None).await;
                     return Ok(SessionOutcome::Stopped);
                 }
             }
@@ -447,7 +505,17 @@ async fn run_session(
     }
 }
 
-async fn publish_metrics_once<S>(ws: &mut S) -> Result<()>
+async fn publish_metrics_once(outbound_tx: &mpsc::UnboundedSender<OutboundMessage>) -> Result<()> {
+    let metrics = collect_metrics()?;
+    outbound_tx
+        .send(OutboundMessage::Metrics(metrics))
+        .map_err(|_| anyhow!("metrics channel closed"))
+        .context("failed to queue metrics payload")?;
+    log_verbose("metrics payload published");
+    Ok(())
+}
+
+async fn send_initial_metrics<S>(ws: &mut S) -> Result<()>
 where
     S: Sink<Message> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
@@ -456,15 +524,41 @@ where
     send_client_message(ws, &ClientMessage::Metrics { payload: &metrics })
         .await
         .context("failed to publish metrics payload")?;
-        log_verbose("metrics payload published");
+    log_verbose("metrics payload published");
     Ok(())
 }
 
-async fn publish_system_info_if_needed<S>(
-    ws: &mut S,
+async fn publish_system_info_if_needed(
+    outbound_tx: &mpsc::UnboundedSender<OutboundMessage>,
     force: bool,
     wireguard: Option<&WireGuardConfig>,
     republish_interval_ms: u64,
+    last_hash: &mut Option<String>,
+    last_published_at: &mut Option<Instant>,
+) -> Result<()> {
+    let system_info = collect_system_info(wireguard).await?;
+    let freshness_due = last_published_at
+        .map(|instant| instant.elapsed() >= Duration::from_millis(republish_interval_ms))
+        .unwrap_or(true);
+    let changed = last_hash.as_ref() != Some(&system_info.hash);
+
+    if force || changed || freshness_due {
+        let hash = system_info.hash.clone();
+        outbound_tx
+            .send(OutboundMessage::SystemInfo(system_info))
+            .map_err(|_| anyhow!("system info channel closed"))
+            .context("failed to queue system info payload")?;
+        *last_hash = Some(hash);
+        *last_published_at = Some(Instant::now());
+        log_verbose("system info payload published");
+    }
+
+    Ok(())
+}
+
+async fn send_initial_system_info<S>(
+    ws: &mut S,
+    wireguard: Option<&WireGuardConfig>,
     last_hash: &mut Option<String>,
     last_published_at: &mut Option<Instant>,
 ) -> Result<()>
@@ -473,20 +567,12 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     let system_info = collect_system_info(wireguard).await?;
-    let freshness_due = last_published_at
-        .map(|instant| instant.elapsed() >= Duration::from_millis(republish_interval_ms))
-        .unwrap_or(true);
-    let changed = last_hash.as_ref() != Some(&system_info.hash);
-
-    if force || changed || freshness_due {
-        send_client_message(ws, &ClientMessage::SystemInfo { payload: &system_info })
-            .await
-            .context("failed to publish system info payload")?;
-        *last_hash = Some(system_info.hash);
-        *last_published_at = Some(Instant::now());
-        log_verbose("system info payload published");
-    }
-
+    send_client_message(ws, &ClientMessage::SystemInfo { payload: &system_info })
+        .await
+        .context("failed to publish system info payload")?;
+    *last_hash = Some(system_info.hash);
+    *last_published_at = Some(Instant::now());
+    log_verbose("system info payload published");
     Ok(())
 }
 

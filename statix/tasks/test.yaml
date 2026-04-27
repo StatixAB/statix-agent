@@ -1,0 +1,19 @@
+name: test
+task:
+  executor: microvm
+  execution:
+    environment:
+      type: microvm
+      image: ubuntu-24.04
+  command:
+    - cargo
+    - test
+  setup:
+    - cargo-deps
+  inputs:
+    sources:
+      - kind: workspace_path
+        path: .
+  constraints:
+    timeoutSeconds: 1800
+    resourceClass: default
