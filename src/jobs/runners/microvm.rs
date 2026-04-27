@@ -329,20 +329,7 @@ async fn launch_qemu(
     let binary = qemu_binary()?;
     let recent_logs = Arc::new(Mutex::new(VecDeque::with_capacity(32)));
     let mut command = Command::new(binary);
-    command
-        .arg("-m")
-        .arg(memory_mb.to_string())
-        .arg("-smp")
-        .arg(cpu.to_string())
-        .arg("-drive")
-        .arg(format!("if=virtio,format=qcow2,file={}", overlay_image.display()))
-        .arg("-drive")
-        .arg(format!("if=virtio,format=raw,file={},media=cdrom", seed_iso.display()))
-        .arg("-netdev")
-        .arg(format!("user,id=net0,hostfwd=tcp::{}-:22", ssh_port))
-        .arg("-device")
-        .arg("virtio-net-pci,netdev=net0")
-        .arg("-nographic");
+    command.args(qemu_launch_args(overlay_image, seed_iso, cpu, memory_mb, ssh_port));
 
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -351,6 +338,34 @@ async fn launch_qemu(
     spawn_qemu_log_stream("stdout", child.stdout.take(), Arc::clone(&recent_logs));
     spawn_qemu_log_stream("stderr", child.stderr.take(), Arc::clone(&recent_logs));
     Ok(QemuProcess { child: Some(child), recent_logs })
+}
+
+fn qemu_launch_args(
+    overlay_image: &Path,
+    seed_iso: &Path,
+    cpu: u8,
+    memory_mb: u32,
+    ssh_port: u16,
+) -> Vec<String> {
+    vec![
+        "-m".to_string(),
+        memory_mb.to_string(),
+        "-smp".to_string(),
+        cpu.to_string(),
+        "-accel".to_string(),
+        "kvm".to_string(),
+        "-accel".to_string(),
+        "tcg,split-wx=on,thread=multi".to_string(),
+        "-drive".to_string(),
+        format!("if=virtio,format=qcow2,file={}", overlay_image.display()),
+        "-drive".to_string(),
+        format!("if=virtio,format=raw,file={},media=cdrom", seed_iso.display()),
+        "-netdev".to_string(),
+        format!("user,id=net0,hostfwd=tcp::{}-:22", ssh_port),
+        "-device".to_string(),
+        "virtio-net-pci,netdev=net0".to_string(),
+        "-nographic".to_string(),
+    ]
 }
 
 fn spawn_qemu_log_stream(
@@ -571,4 +586,43 @@ fn image_cache_key(url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(url.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qemu_launch_args_enable_kvm_fallback_and_split_wx_tcg() {
+        let overlay_image = Path::new("/tmp/disk.qcow2");
+        let seed_iso = Path::new("/tmp/seed.iso");
+
+        let args = qemu_launch_args(overlay_image, seed_iso, 4, 2048, 2222);
+
+        assert_eq!(
+            args,
+            vec![
+                "-m",
+                "2048",
+                "-smp",
+                "4",
+                "-accel",
+                "kvm",
+                "-accel",
+                "tcg,split-wx=on,thread=multi",
+                "-drive",
+                "if=virtio,format=qcow2,file=/tmp/disk.qcow2",
+                "-drive",
+                "if=virtio,format=raw,file=/tmp/seed.iso,media=cdrom",
+                "-netdev",
+                "user,id=net0,hostfwd=tcp::2222-:22",
+                "-device",
+                "virtio-net-pci,netdev=net0",
+                "-nographic",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+        );
+    }
 }
