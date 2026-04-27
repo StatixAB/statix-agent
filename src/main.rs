@@ -76,7 +76,8 @@ struct AgentJob {
 enum JobEnvironment {
     Host,
     Microvm {
-        image: String,
+        #[serde(default)]
+        image: Option<String>,
         #[serde(default)]
         cpu: Option<u8>,
         #[serde(rename = "memoryMb", default)]
@@ -557,7 +558,11 @@ async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<jobs::JobEx
             let environment = match execution.environment.unwrap_or(JobEnvironment::Host) {
                 JobEnvironment::Host => RunnerEnvironment::Host,
                 JobEnvironment::Microvm { image, cpu, memory_mb } => {
-                    RunnerEnvironment::Microvm { image, cpu, memory_mb }
+                    RunnerEnvironment::Microvm {
+                        image: image.unwrap_or_else(|| config.microvm_default_image.clone()),
+                        cpu: cpu.or(Some(config.microvm_default_cpu)),
+                        memory_mb: memory_mb.or(Some(config.microvm_default_memory_mb)),
+                    }
                 }
             };
 

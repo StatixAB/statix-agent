@@ -22,6 +22,9 @@ API_BASE_URL="${STATIX_API_BASE_URL:-}"
 NODE_NAME="${STATIX_NODE_NAME:-}"
 SKIP_LOGIN="${STATIX_SKIP_LOGIN:-0}"
 SKIP_START="${STATIX_SKIP_START:-0}"
+MICROVM_IMAGE="${STATIX_MICROVM_IMAGE:-ubuntu-24.04}"
+MICROVM_CPU="${STATIX_MICROVM_CPU:-2}"
+MICROVM_MEMORY_MB="${STATIX_MICROVM_MEMORY_MB:-4096}"
 
 log() {
   printf '[statix-installer] %s\n' "$*"
@@ -94,8 +97,13 @@ install_dependencies() {
   apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    cloud-image-utils \
     iproute2 \
     pciutils \
+    qemu-system-arm \
+    qemu-system-x86 \
+    qemu-utils \
+    openssh-client \
     wireguard-tools
 }
 
@@ -201,6 +209,9 @@ write_environment_file() {
     printf 'STATIX_AGENT_CONFIG=%s\n' "$CONFIG_PATH"
     printf 'STATIX_VERSION_FILE=%s\n' "$VERSION_FILE"
     printf 'STATIX_DOWNLOAD_BASE_URL=%s\n' "$DOWNLOAD_BASE_URL"
+    printf 'STATIX_MICROVM_IMAGE=%s\n' "$MICROVM_IMAGE"
+    printf 'STATIX_MICROVM_CPU=%s\n' "$MICROVM_CPU"
+    printf 'STATIX_MICROVM_MEMORY_MB=%s\n' "$MICROVM_MEMORY_MB"
   } >"$ENV_FILE"
 }
 

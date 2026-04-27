@@ -20,6 +20,9 @@ pub struct AgentConfig {
     pub reconnect_delay_ms: u64,
     pub connect_timeout_ms: u64,
     pub wireguard: Option<WireGuardConfig>,
+    pub microvm_default_image: String,
+    pub microvm_default_cpu: u8,
+    pub microvm_default_memory_mb: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +122,13 @@ impl AgentConfig {
             reconnect_delay_ms: parse_positive_int("RECONNECT_DELAY_MS", 3_000),
             connect_timeout_ms: parse_positive_int("WS_CONNECT_TIMEOUT_MS", 8_000),
             wireguard: resolve_wireguard_config(persisted.as_ref()),
+            microvm_default_image: env::var("STATIX_MICROVM_IMAGE")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "ubuntu-24.04".to_string()),
+            microvm_default_cpu: parse_positive_u8("STATIX_MICROVM_CPU", 2),
+            microvm_default_memory_mb: parse_positive_u32("STATIX_MICROVM_MEMORY_MB", 4096),
         })
     }
 }
@@ -223,6 +233,22 @@ fn parse_positive_int(name: &str, fallback: u64) -> u64 {
     env::var(name)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
+}
+
+fn parse_positive_u8(name: &str, fallback: u8) -> u8 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
+}
+
+fn parse_positive_u32(name: &str, fallback: u32) -> u32 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(fallback)
 }

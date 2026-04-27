@@ -5,3 +5,6 @@ source:
 preset: cargo_test
 args: []
 timeoutSeconds: 1800
+execution:
+  environment:
+    type: microvm

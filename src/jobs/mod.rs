@@ -40,12 +40,11 @@ pub async fn execute(
 ) -> Result<JobExecutionResult> {
     match environment {
         RunnerEnvironment::Host => runners::host::HostRunner.execute(ctx, workspace, command).await,
-        RunnerEnvironment::Microvm { image, .. } => Ok(JobExecutionResult {
-            status: "rejected",
-            message: Some(format!(
-                "microvm runner is not implemented yet for image {image}"
-            )),
-        }),
+        RunnerEnvironment::Microvm { image, cpu, memory_mb } => {
+            runners::microvm::MicrovmRunner::new(image.clone(), *cpu, *memory_mb)
+                .execute(ctx, workspace, command)
+                .await
+        }
     }
 }
 
