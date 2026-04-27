@@ -170,11 +170,31 @@ async fn dispatch() -> Result<()> {
     }
 }
 
+fn format_error_chain(error: &anyhow::Error) -> String {
+    let mut parts = Vec::new();
+    for cause in error.chain() {
+        let text = cause.to_string();
+        if parts.last() == Some(&text) {
+            continue;
+        }
+        parts.push(text);
+    }
+
+    parts.join(": ")
+}
+
 async fn run_agent() -> Result<()> {
     let config = AgentConfig::load().context(
         "Agent identity not configured. Run `statix login --api-base-url http://host:3001` or set NODE_ID/NODE_TOKEN in the environment.",
     )?;
     eprintln!("[statix-agent] starting with nodeId: {}", config.node_id);
+        log_verbose(&format!(
+            "runtime config: ws={}, api={}, publish={}ms, system-check={}ms",
+            config.agent_ws_url,
+            config.api_base_url,
+            config.publish_interval_ms,
+            config.system_info_check_interval_ms
+        ));
 
     if let Some(wireguard) = config
         .wireguard
@@ -288,7 +308,11 @@ async fn run_session(
                         Ok(ServerMessage::Error { error }) => {
                             return Err(anyhow!("server error: {error}"));
                         }
+                        Ok(ServerMessage::Ready { node_id }) => {
+                            log_verbose(&format!("server ready for nodeId={node_id}"));
+                        }
                         Ok(ServerMessage::Job { job }) => {
+                            log_verbose(&format!("received job {}", job.id));
                             let _issued_at = job.issued_at;
                             let accepted = send_client_message(
                                 &mut ws,
@@ -300,6 +324,7 @@ async fn run_session(
                             )
                             .await;
                             if accepted.is_err() {
+                                log_verbose(&format!("failed to send accepted status for job {}", job.id));
                                 continue;
                             }
 
@@ -315,6 +340,7 @@ async fn run_session(
 
                             match execute_job(config, &job).await {
                                 Ok(result) => {
+                                    log_verbose(&format!("job {} finished with status {}", job.id, result.status));
                                     let _ = send_client_message(
                                         &mut ws,
                                         &ClientMessage::JobStatus {
@@ -326,7 +352,8 @@ async fn run_session(
                                     .await;
                                 }
                                 Err(error) => {
-                                    let message = error.to_string();
+                                    let message = format_error_chain(&error);
+                                    log_verbose(&format!("job {} failed: {message}", job.id));
                                     let _ = send_client_message(
                                         &mut ws,
                                         &ClientMessage::JobStatus {
@@ -339,7 +366,12 @@ async fn run_session(
                                 }
                             }
                         }
-                        Ok(ServerMessage::Ready { .. }) | Err(_) => {}
+                        Err(_) => {
+                            log_verbose(&format!(
+                                "ignored non-server-message websocket payload: {}",
+                                truncate_for_log(&text, 200)
+                            ));
+                        }
                     }
                 }
                 Some(Ok(Message::Close(frame))) => {
@@ -396,6 +428,7 @@ where
     send_client_message(ws, &ClientMessage::Metrics { payload: &metrics })
         .await
         .context("failed to publish metrics payload")?;
+        log_verbose("metrics payload published");
     Ok(())
 }
 
@@ -423,6 +456,7 @@ where
             .context("failed to publish system info payload")?;
         *last_hash = Some(system_info.hash);
         *last_published_at = Some(Instant::now());
+        log_verbose("system info payload published");
     }
 
     Ok(())
@@ -492,6 +526,7 @@ async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<JobExecutio
 }
 
 async fn prepare_job_workdir(config: &AgentConfig, job_id: &str, source: &JobSource) -> Result<PathBuf> {
+    log_verbose(&format!("preparing workdir for job {job_id}"));
     match source {
         JobSource::GitCheckout {
             repo_url,
@@ -499,6 +534,7 @@ async fn prepare_job_workdir(config: &AgentConfig, job_id: &str, source: &JobSou
             commit_sha,
             subdir,
         } => {
+            log_verbose(&format!("job {job_id}: materializing git checkout from {repo_url}"));
             let checkout_root = materialize_git_checkout(repo_url, git_ref, commit_sha).await?;
             let workdir = match subdir.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
                 Some(value) => checkout_root.join(value),
@@ -512,6 +548,7 @@ async fn prepare_job_workdir(config: &AgentConfig, job_id: &str, source: &JobSou
             Ok(workdir)
         }
         JobSource::WorkspaceArchive { subdir } => {
+            log_verbose(&format!("job {job_id}: materializing workspace archive"));
             let workspace_root = materialize_workspace_archive(config, job_id).await?;
             let workdir = match subdir
                 .as_deref()
@@ -634,8 +671,10 @@ async fn materialize_workspace_archive(config: &AgentConfig, job_id: &str) -> Re
 
 async fn download_job_source_archive(config: &AgentConfig, job_id: &str) -> Result<Vec<u8>> {
     let client = reqwest::Client::new();
+        let archive_url = format!("{}/jobs/{job_id}/source", config.api_base_url);
+        log_verbose(&format!("downloading source archive from {archive_url}"));
     let response = client
-        .get(format!("{}/jobs/{job_id}/source", config.api_base_url))
+            .get(&archive_url)
         .header("x-statix-node-id", &config.node_id)
         .header("x-statix-node-token", &config.node_token)
         .send()
@@ -655,7 +694,29 @@ async fn download_job_source_archive(config: &AgentConfig, job_id: &str) -> Resu
         );
     }
 
-    Ok(response.bytes().await?.to_vec())
+    let bytes = response.bytes().await?.to_vec();
+    log_verbose(&format!("downloaded source archive for job {job_id} ({} bytes)", bytes.len()));
+    Ok(bytes)
+}
+
+fn verbose_logs_enabled() -> bool {
+    env_flag("STATIX_VERBOSE_LOGS")
+}
+
+fn log_verbose(message: &str) {
+    if verbose_logs_enabled() {
+        eprintln!("[statix-agent][debug] {message}");
+    }
+}
+
+fn truncate_for_log(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let mut shortened = value.chars().take(max_chars).collect::<String>();
+    shortened.push_str("...");
+    shortened
 }
 
 async fn extract_archive(

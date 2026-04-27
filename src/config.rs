@@ -98,12 +98,12 @@ impl AgentConfig {
                     })
             })
             .or_else(|| persisted.as_ref().map(|value| value.agent_ws_url.clone()))?;
-        let api_base_url = env::var("API_BASE_URL")
+        let api_base_url = normalize_api_base_url(&env::var("API_BASE_URL")
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .or_else(|| persisted.as_ref().and_then(|value| value.api_base_url.clone()))
-            .unwrap_or_else(|| api_base_url_from_ws_url(&agent_ws_url));
+            .unwrap_or_else(|| api_base_url_from_ws_url(&agent_ws_url)));
 
         Some(Self {
             node_id,
@@ -543,6 +543,12 @@ mod tests {
         let api_base_url =
             resolve_login_api_base_url(Some("https://statix.se".to_owned()), None, None);
         assert_eq!(api_base_url, "https://statix.se/api");
+    }
+
+    #[test]
+    fn normalize_api_base_url_appends_api_for_hosted_subdomain_root_url() {
+        let api_base_url = normalize_api_base_url("https://dev.statix.se/");
+        assert_eq!(api_base_url, "https://dev.statix.se/api");
     }
 
     #[test]
