@@ -1,5 +1,6 @@
 mod config;
 mod enrollment;
+mod jobs;
 mod metrics;
 mod system_info;
 mod wireguard;
@@ -19,13 +20,14 @@ use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::{
     select, signal,
-    sync::watch,
     process::Command as TokioCommand,
+    sync::watch,
     time::{MissedTickBehavior, interval},
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
+    jobs::{ExecutionContext, PreparedWorkspace, RunnerEnvironment},
     metrics::collect_metrics,
     system_info::collect_system_info,
     wireguard::ensure_applied as ensure_wireguard_applied,
@@ -69,6 +71,30 @@ struct AgentJob {
     spec: AgentJobSpec,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum JobEnvironment {
+    Host,
+    Microvm {
+        image: String,
+        #[serde(default)]
+        cpu: Option<u8>,
+        #[serde(rename = "memoryMb", default)]
+        memory_mb: Option<u32>,
+    },
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct JobExecutionConfig {
+    #[serde(default)]
+    job_id: Option<String>,
+    #[serde(default)]
+    attempt_id: Option<String>,
+    #[serde(default)]
+    environment: Option<JobEnvironment>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind")]
 enum AgentJobSpec {
@@ -77,6 +103,8 @@ enum AgentJobSpec {
         #[serde(rename = "targetVersion")]
         target_version: Option<String>,
         channel: Option<String>,
+        #[serde(default)]
+        execution: Option<JobExecutionConfig>,
     },
     #[serde(rename = "run_test")]
     RunTest {
@@ -86,6 +114,8 @@ enum AgentJobSpec {
         args: Vec<String>,
         #[serde(rename = "timeoutSeconds")]
         timeout_seconds: Option<u64>,
+        #[serde(default)]
+        execution: Option<JobExecutionConfig>,
     },
 }
 
@@ -105,14 +135,11 @@ enum JobSource {
     },
     #[serde(rename = "workspace_archive")]
     WorkspaceArchive {
+        #[serde(rename = "archiveId", default)]
+        archive_id: Option<String>,
         #[serde(default)]
         subdir: Option<String>,
     },
-}
-
-struct JobExecutionResult {
-    status: &'static str,
-    message: Option<String>,
 }
 
 enum SessionOutcome {
@@ -495,16 +522,17 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
-async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<JobExecutionResult> {
+async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<jobs::JobExecutionResult> {
     match &job.spec {
         AgentJobSpec::UpdateAgent {
             target_version,
             channel,
+            ..
         } => {
             let _ = target_version.as_deref();
             let _ = channel.as_deref();
             request_update().await?;
-            Ok(JobExecutionResult {
+            Ok(jobs::JobExecutionResult {
                 status: "succeeded",
                 message: Some("agent update requested".to_string()),
             })
@@ -514,18 +542,53 @@ async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<JobExecutio
             source,
             args,
             timeout_seconds,
+            execution,
         } => {
             if preset != "cargo_test" {
                 bail!("unsupported test preset: {preset}");
             }
 
-            let cwd = prepare_job_workdir(config, &job.id, source).await?;
-            run_cargo_test(&cwd, args, timeout_seconds.unwrap_or(1800)).await
+            let workspace = prepare_job_workdir(config, &job.id, source).await?;
+            let execution = execution.clone().unwrap_or(JobExecutionConfig {
+                job_id: None,
+                attempt_id: None,
+                environment: None,
+            });
+            let environment = match execution.environment.unwrap_or(JobEnvironment::Host) {
+                JobEnvironment::Host => RunnerEnvironment::Host,
+                JobEnvironment::Microvm { image, cpu, memory_mb } => {
+                    RunnerEnvironment::Microvm { image, cpu, memory_mb }
+                }
+            };
+
+            jobs::execute(
+                &environment,
+                &ExecutionContext {
+                    job_id: execution.job_id.unwrap_or_else(|| job.id.clone()),
+                    attempt_id: execution.attempt_id.unwrap_or_else(|| job.id.clone()),
+                    timeout_seconds: timeout_seconds.unwrap_or(1800),
+                },
+                &workspace,
+                &cargo_test_command(args),
+            )
+            .await
         }
     }
 }
 
-async fn prepare_job_workdir(config: &AgentConfig, job_id: &str, source: &JobSource) -> Result<PathBuf> {
+fn cargo_test_command(args: &[String]) -> Vec<String> {
+    let mut command = Vec::with_capacity(args.len() + 2);
+    command.push("cargo".to_string());
+    command.push("test".to_string());
+    command.extend(args.iter().cloned());
+    command
+}
+
+async fn prepare_job_workdir(
+    config: &AgentConfig,
+    job_id: &str,
+    source: &JobSource,
+) -> Result<PreparedWorkspace> {
     log_verbose(&format!("preparing workdir for job {job_id}"));
     match source {
         JobSource::GitCheckout {
@@ -538,16 +601,19 @@ async fn prepare_job_workdir(config: &AgentConfig, job_id: &str, source: &JobSou
             let checkout_root = materialize_git_checkout(repo_url, git_ref, commit_sha).await?;
             let workdir = match subdir.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
                 Some(value) => checkout_root.join(value),
-                None => checkout_root,
+                None => checkout_root.clone(),
             };
 
             if !workdir.is_dir() {
                 bail!("resolved workdir does not exist: {}", workdir.display());
             }
 
-            Ok(workdir)
+            Ok(PreparedWorkspace {
+                host_path: checkout_root,
+                workdir,
+            })
         }
-        JobSource::WorkspaceArchive { subdir } => {
+        JobSource::WorkspaceArchive { subdir, .. } => {
             log_verbose(&format!("job {job_id}: materializing workspace archive"));
             let workspace_root = materialize_workspace_archive(config, job_id).await?;
             let workdir = match subdir
@@ -556,45 +622,18 @@ async fn prepare_job_workdir(config: &AgentConfig, job_id: &str, source: &JobSou
                 .filter(|value| !value.is_empty())
             {
                 Some(value) => workspace_root.join(value),
-                None => workspace_root,
+                None => workspace_root.clone(),
             };
 
             if !workdir.is_dir() {
                 bail!("resolved workdir does not exist: {}", workdir.display());
             }
 
-            Ok(workdir)
+            Ok(PreparedWorkspace {
+                host_path: workspace_root,
+                workdir,
+            })
         }
-    }
-}
-
-async fn run_cargo_test(cwd: &std::path::Path, args: &[String], timeout_seconds: u64) -> Result<JobExecutionResult> {
-    if timeout_seconds == 0 || timeout_seconds > 3600 {
-        bail!("run_test timeoutSeconds must be between 1 and 3600");
-    }
-
-    let mut command = TokioCommand::new("cargo");
-    command.arg("test");
-    command.args(args);
-    command.current_dir(cwd);
-    command.kill_on_drop(true);
-
-    let output = tokio::time::timeout(Duration::from_secs(timeout_seconds), command.output())
-        .await
-        .map_err(|_| anyhow!("cargo test timed out after {timeout_seconds} seconds"))?
-        .with_context(|| format!("failed to run cargo test in {}", cwd.display()))?;
-
-    let message = summarize_command_output(cwd, &output.stdout, &output.stderr);
-    if output.status.success() {
-        Ok(JobExecutionResult {
-            status: "succeeded",
-            message: Some(message),
-        })
-    } else {
-        Ok(JobExecutionResult {
-            status: "failed",
-            message: Some(message),
-        })
     }
 }
 
@@ -789,27 +828,6 @@ fn hash_key(value: &str) -> String {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
-}
-
-fn summarize_command_output(cwd: &std::path::Path, stdout: &[u8], stderr: &[u8]) -> String {
-    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
-    let body = if !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() {
-        stdout
-    } else {
-        "command completed with no output".to_string()
-    };
-    let truncated = if body.chars().count() > 400 {
-        let mut shortened = body.chars().take(400).collect::<String>();
-        shortened.push_str("...");
-        shortened
-    } else {
-        body
-    };
-
-    format!("{}: {truncated}", cwd.display())
 }
 
 async fn request_update() -> Result<()> {
