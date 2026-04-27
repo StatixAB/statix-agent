@@ -4,11 +4,16 @@ mod metrics;
 mod system_info;
 mod wireguard;
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
-use config::{AgentConfig, WireGuardConfig, resolve_login_config};
+use config::{AgentConfig, WireGuardConfig, agent_state_dir, resolve_login_config};
 use enrollment::{LoginOptions, run_login};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -73,6 +78,41 @@ enum AgentJobSpec {
         target_version: Option<String>,
         channel: Option<String>,
     },
+    #[serde(rename = "run_test")]
+    RunTest {
+        preset: String,
+        source: JobSource,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(rename = "timeoutSeconds")]
+        timeout_seconds: Option<u64>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind")]
+enum JobSource {
+    #[serde(rename = "git_checkout")]
+    GitCheckout {
+        #[serde(rename = "repoUrl")]
+        repo_url: String,
+        #[serde(rename = "ref")]
+        git_ref: String,
+        #[serde(rename = "commitSha")]
+        commit_sha: String,
+        #[serde(default)]
+        subdir: Option<String>,
+    },
+    #[serde(rename = "workspace_archive")]
+    WorkspaceArchive {
+        #[serde(default)]
+        subdir: Option<String>,
+    },
+}
+
+struct JobExecutionResult {
+    status: &'static str,
+    message: Option<String>,
 }
 
 enum SessionOutcome {
@@ -263,14 +303,24 @@ async fn run_session(
                                 continue;
                             }
 
-                            match execute_job(&job).await {
-                                Ok(status) => {
+                            let _ = send_client_message(
+                                &mut ws,
+                                &ClientMessage::JobStatus {
+                                    job_id: &job.id,
+                                    status: "started",
+                                    message: None,
+                                },
+                            )
+                            .await;
+
+                            match execute_job(config, &job).await {
+                                Ok(result) => {
                                     let _ = send_client_message(
                                         &mut ws,
                                         &ClientMessage::JobStatus {
                                             job_id: &job.id,
-                                            status,
-                                            message: None,
+                                            status: result.status,
+                                            message: result.message.as_deref(),
                                         },
                                     )
                                     .await;
@@ -411,7 +461,7 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
-async fn execute_job(job: &AgentJob) -> Result<&'static str> {
+async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<JobExecutionResult> {
     match &job.spec {
         AgentJobSpec::UpdateAgent {
             target_version,
@@ -420,9 +470,285 @@ async fn execute_job(job: &AgentJob) -> Result<&'static str> {
             let _ = target_version.as_deref();
             let _ = channel.as_deref();
             request_update().await?;
-            Ok("started")
+            Ok(JobExecutionResult {
+                status: "succeeded",
+                message: Some("agent update requested".to_string()),
+            })
+        }
+        AgentJobSpec::RunTest {
+            preset,
+            source,
+            args,
+            timeout_seconds,
+        } => {
+            if preset != "cargo_test" {
+                bail!("unsupported test preset: {preset}");
+            }
+
+            let cwd = prepare_job_workdir(config, &job.id, source).await?;
+            run_cargo_test(&cwd, args, timeout_seconds.unwrap_or(1800)).await
         }
     }
+}
+
+async fn prepare_job_workdir(config: &AgentConfig, job_id: &str, source: &JobSource) -> Result<PathBuf> {
+    match source {
+        JobSource::GitCheckout {
+            repo_url,
+            git_ref,
+            commit_sha,
+            subdir,
+        } => {
+            let checkout_root = materialize_git_checkout(repo_url, git_ref, commit_sha).await?;
+            let workdir = match subdir.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+                Some(value) => checkout_root.join(value),
+                None => checkout_root,
+            };
+
+            if !workdir.is_dir() {
+                bail!("resolved workdir does not exist: {}", workdir.display());
+            }
+
+            Ok(workdir)
+        }
+        JobSource::WorkspaceArchive { subdir } => {
+            let workspace_root = materialize_workspace_archive(config, job_id).await?;
+            let workdir = match subdir
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(value) => workspace_root.join(value),
+                None => workspace_root,
+            };
+
+            if !workdir.is_dir() {
+                bail!("resolved workdir does not exist: {}", workdir.display());
+            }
+
+            Ok(workdir)
+        }
+    }
+}
+
+async fn run_cargo_test(cwd: &std::path::Path, args: &[String], timeout_seconds: u64) -> Result<JobExecutionResult> {
+    if timeout_seconds == 0 || timeout_seconds > 3600 {
+        bail!("run_test timeoutSeconds must be between 1 and 3600");
+    }
+
+    let mut command = TokioCommand::new("cargo");
+    command.arg("test");
+    command.args(args);
+    command.current_dir(cwd);
+    command.kill_on_drop(true);
+
+    let output = tokio::time::timeout(Duration::from_secs(timeout_seconds), command.output())
+        .await
+        .map_err(|_| anyhow!("cargo test timed out after {timeout_seconds} seconds"))?
+        .with_context(|| format!("failed to run cargo test in {}", cwd.display()))?;
+
+    let message = summarize_command_output(cwd, &output.stdout, &output.stderr);
+    if output.status.success() {
+        Ok(JobExecutionResult {
+            status: "succeeded",
+            message: Some(message),
+        })
+    } else {
+        Ok(JobExecutionResult {
+            status: "failed",
+            message: Some(message),
+        })
+    }
+}
+
+async fn materialize_git_checkout(repo_url: &str, git_ref: &str, commit_sha: &str) -> Result<PathBuf> {
+    let root = agent_state_dir()?.join("jobs").join("git");
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("failed to create {}", root.display()))?;
+
+    let repo_dir = root.join(hash_key(repo_url));
+    if !repo_dir.exists() {
+        run_git(
+            &[
+                "clone",
+                "--no-checkout",
+                repo_url,
+                repo_dir.to_string_lossy().as_ref(),
+            ],
+            None,
+        )
+        .await
+        .with_context(|| format!("failed to clone {repo_url}"))?;
+    } else {
+        run_git(&["remote", "set-url", "origin", repo_url], Some(&repo_dir))
+            .await
+            .with_context(|| format!("failed to update origin url for {}", repo_dir.display()))?;
+    }
+
+    run_git(&["fetch", "--depth", "1", "origin", git_ref], Some(&repo_dir))
+        .await
+        .with_context(|| format!("failed to fetch {git_ref} from {repo_url}"))?;
+
+    let fetched_commit = run_git_output(&["rev-parse", "FETCH_HEAD"], Some(&repo_dir))
+        .await
+        .context("failed to resolve FETCH_HEAD")?;
+    if fetched_commit.trim() != commit_sha.trim() {
+        bail!(
+            "fetched commit {} does not match expected {} for ref {}",
+            fetched_commit.trim(),
+            commit_sha.trim(),
+            git_ref
+        );
+    }
+
+    run_git(&["checkout", "--force", commit_sha], Some(&repo_dir))
+        .await
+        .with_context(|| format!("failed to checkout {commit_sha}"))?;
+    run_git(&["clean", "-fdx"], Some(&repo_dir))
+        .await
+        .context("failed to clean checkout")?;
+
+    Ok(repo_dir)
+}
+
+async fn materialize_workspace_archive(config: &AgentConfig, job_id: &str) -> Result<PathBuf> {
+    let job_root = agent_state_dir()?.join("jobs").join("runs").join(job_id);
+    let workspace_root = job_root.join("workspace");
+    let archive_path = job_root.join("source.tar.gz");
+    std::fs::create_dir_all(&job_root)
+        .with_context(|| format!("failed to create {}", job_root.display()))?;
+    if workspace_root.exists() {
+        std::fs::remove_dir_all(&workspace_root)
+            .with_context(|| format!("failed to reset {}", workspace_root.display()))?;
+    }
+    std::fs::create_dir_all(&workspace_root)
+        .with_context(|| format!("failed to create {}", workspace_root.display()))?;
+
+    let archive_bytes = download_job_source_archive(config, job_id).await?;
+    std::fs::write(&archive_path, archive_bytes)
+        .with_context(|| format!("failed to write {}", archive_path.display()))?;
+
+    extract_archive(&archive_path, &workspace_root).await?;
+    Ok(workspace_root)
+}
+
+async fn download_job_source_archive(config: &AgentConfig, job_id: &str) -> Result<Vec<u8>> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{}/jobs/{job_id}/source", config.api_base_url))
+        .header("x-statix-node-id", &config.node_id)
+        .header("x-statix-node-token", &config.node_token)
+        .send()
+        .await
+        .with_context(|| format!("failed to request source archive for job {job_id}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "request failed".to_string());
+        bail!(
+            "source archive download failed ({}): {}",
+            status.as_u16(),
+            body
+        );
+    }
+
+    Ok(response.bytes().await?.to_vec())
+}
+
+async fn extract_archive(
+    archive_path: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<()> {
+    let output = TokioCommand::new("tar")
+        .arg("-xzf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(destination)
+        .output()
+        .await
+        .with_context(|| format!("failed to extract {}", archive_path.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "tar extraction failed: {}",
+            if stderr.is_empty() {
+                "unknown error"
+            } else {
+                &stderr
+            }
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_git(args: &[&str], cwd: Option<&std::path::Path>) -> Result<()> {
+    let output = build_git_command(args, cwd).output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            if stderr.is_empty() { "unknown error" } else { &stderr }
+        );
+    }
+
+    Ok(())
+}
+
+async fn run_git_output(args: &[&str], cwd: Option<&std::path::Path>) -> Result<String> {
+    let output = build_git_command(args, cwd).output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            if stderr.is_empty() { "unknown error" } else { &stderr }
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn build_git_command(args: &[&str], cwd: Option<&std::path::Path>) -> TokioCommand {
+    let mut command = TokioCommand::new("git");
+    command.args(args);
+    if let Some(path) = cwd {
+        command.current_dir(path);
+    }
+    command.kill_on_drop(true);
+    command
+}
+
+fn hash_key(value: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn summarize_command_output(cwd: &std::path::Path, stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    let body = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "command completed with no output".to_string()
+    };
+    let truncated = if body.chars().count() > 400 {
+        let mut shortened = body.chars().take(400).collect::<String>();
+        shortened.push_str("...");
+        shortened
+    } else {
+        body
+    };
+
+    format!("{}: {truncated}", cwd.display())
 }
 
 async fn request_update() -> Result<()> {

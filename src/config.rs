@@ -6,13 +6,14 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_API_BASE_URL: &str = "https://statix.pettersson.online";
+const DEFAULT_API_BASE_URL: &str = "https://statix.se/api";
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub node_id: String,
     pub node_token: String,
     pub agent_ws_url: String,
+    pub api_base_url: String,
     pub publish_interval_ms: u64,
     pub system_info_check_interval_ms: u64,
     pub system_info_republish_interval_ms: u64,
@@ -97,11 +98,18 @@ impl AgentConfig {
                     })
             })
             .or_else(|| persisted.as_ref().map(|value| value.agent_ws_url.clone()))?;
+        let api_base_url = env::var("API_BASE_URL")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .or_else(|| persisted.as_ref().and_then(|value| value.api_base_url.clone()))
+            .unwrap_or_else(|| api_base_url_from_ws_url(&agent_ws_url));
 
         Some(Self {
             node_id,
             node_token,
             agent_ws_url,
+            api_base_url,
             publish_interval_ms: parse_positive_int("PUBLISH_INTERVAL_MS", 5_000),
             system_info_check_interval_ms: parse_positive_int("SYSTEM_INFO_CHECK_INTERVAL_MS", 10 * 60_000),
             system_info_republish_interval_ms: parse_positive_int(
@@ -339,6 +347,32 @@ fn trim_trailing_slash(value: &str) -> String {
     value.trim_end_matches('/').to_owned()
 }
 
+fn normalize_api_base_url(value: &str) -> String {
+    let trimmed = trim_trailing_slash(value.trim());
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let Some(hostname) = extract_hostname(&trimmed) else {
+        return trimmed;
+    };
+
+    let without_scheme = trimmed
+        .split_once("://")
+        .map(|(_, remainder)| remainder)
+        .unwrap_or(trimmed.as_str());
+    let path = without_scheme
+        .find('/')
+        .map(|index| &without_scheme[index..])
+        .unwrap_or("");
+
+    if (hostname == "statix.se" || hostname.ends_with(".statix.se")) && path.is_empty() {
+        return format!("{trimmed}/api");
+    }
+
+    trimmed
+}
+
 fn resolve_login_api_base_url(
     explicit_api_base_url: Option<String>,
     env_api_base_url: Option<String>,
@@ -360,7 +394,7 @@ fn resolve_login_api_base_url(
         })
         .unwrap_or_else(|| DEFAULT_API_BASE_URL.to_owned());
 
-    trim_trailing_slash(&api_base_url)
+    normalize_api_base_url(&api_base_url)
 }
 
 fn is_loopback_like_url(value: &str) -> bool {
@@ -417,6 +451,22 @@ fn to_ws_base_url(value: &str) -> String {
     format!("ws://{value}")
 }
 
+fn api_base_url_from_ws_url(value: &str) -> String {
+    let base = if let Some(suffix) = value.strip_prefix("wss://") {
+        format!("https://{suffix}")
+    } else if let Some(suffix) = value.strip_prefix("ws://") {
+        format!("http://{suffix}")
+    } else {
+        value.to_owned()
+    };
+
+    if let Some(stripped) = base.strip_suffix("/ws/agent") {
+        return stripped.to_owned();
+    }
+
+    trim_trailing_slash(&base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,5 +515,19 @@ mod tests {
             Some("https://selfhosted.example.com/".to_owned()),
         );
         assert_eq!(api_base_url, "https://selfhosted.example.com");
+    }
+
+    #[test]
+    fn resolve_login_config_appends_api_for_hosted_root_url() {
+        let api_base_url =
+            resolve_login_api_base_url(Some("https://statix.se".to_owned()), None, None);
+        assert_eq!(api_base_url, "https://statix.se/api");
+    }
+
+    #[test]
+    fn resolve_login_config_keeps_local_root_url() {
+        let api_base_url =
+            resolve_login_api_base_url(Some("http://localhost:3001/".to_owned()), None, None);
+        assert_eq!(api_base_url, "http://localhost:3001");
     }
 }

@@ -1,0 +1,7 @@
+kind: run_test
+source:
+  path: .
+  workdir: .
+preset: cargo_test
+args: []
+timeoutSeconds: 1800

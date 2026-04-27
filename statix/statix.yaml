@@ -1,0 +1,12 @@
+workspace:
+  name: statix-agent
+deploy:
+  target: local
+  runtime: docker
+services: {}
+volumes: {}
+secrets: {}
+agent:
+  required: false
+network:
+  enabled: false
