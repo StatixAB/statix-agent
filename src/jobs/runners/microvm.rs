@@ -1,7 +1,9 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::collections::VecDeque;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -24,10 +26,44 @@ pub struct MicrovmRunner {
 
 struct QemuProcess {
     child: Option<Child>,
+    recent_logs: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl QemuProcess {
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+
+        let status = child.try_wait().context("failed to poll qemu status")?;
+        if status.is_some() {
+            self.child.take();
+        }
+
+        Ok(status)
+    }
+
+    fn failure_message(&self, status: std::process::ExitStatus) -> String {
+        let logs = self
+            .recent_logs
+            .lock()
+            .ok()
+            .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default();
+
+        if logs.trim().is_empty() {
+            format!("qemu exited before the guest became ready: {status}")
+        } else {
+            format!("qemu exited before the guest became ready: {status}\nrecent qemu logs:\n{logs}")
+        }
+    }
+
     async fn shutdown(&mut self) {
+        if let Ok(Some(status)) = self.try_wait() {
+            log_qemu_exit_status(Ok(status));
+            return;
+        }
+
         if let Some(mut child) = self.child.take() {
             let _ = tokio::task::spawn_blocking(move || {
                 let _ = child.kill();
@@ -95,7 +131,7 @@ impl Runner for MicrovmRunner {
         )
         .await?;
 
-        let result = match wait_for_guest_ready(DEFAULT_SSH_PORT, ctx.timeout_seconds).await {
+        let result = match wait_for_guest_ready(&mut qemu, DEFAULT_SSH_PORT, ctx.timeout_seconds).await {
             Ok(()) => run_guest_command(
                 DEFAULT_SSH_PORT,
                 &private_key,
@@ -291,6 +327,7 @@ async fn launch_qemu(
     ssh_port: u16,
 ) -> Result<QemuProcess> {
     let binary = qemu_binary()?;
+    let recent_logs = Arc::new(Mutex::new(VecDeque::with_capacity(32)));
     let mut command = Command::new(binary);
     command
         .arg("-m")
@@ -311,14 +348,15 @@ async fn launch_qemu(
     command.stderr(Stdio::piped());
 
     let mut child = command.spawn().context("failed to launch qemu")?;
-    spawn_qemu_log_stream("stdout", child.stdout.take());
-    spawn_qemu_log_stream("stderr", child.stderr.take());
-    Ok(QemuProcess { child: Some(child) })
+    spawn_qemu_log_stream("stdout", child.stdout.take(), Arc::clone(&recent_logs));
+    spawn_qemu_log_stream("stderr", child.stderr.take(), Arc::clone(&recent_logs));
+    Ok(QemuProcess { child: Some(child), recent_logs })
 }
 
 fn spawn_qemu_log_stream(
     label: &'static str,
     stream: Option<impl std::io::Read + Send + 'static>,
+    recent_logs: Arc<Mutex<VecDeque<String>>>,
 ) {
     let Some(stream) = stream else {
         return;
@@ -328,10 +366,18 @@ fn spawn_qemu_log_stream(
         let reader = BufReader::new(stream);
         for line in reader.lines() {
             match line {
-                Ok(line) if verbose_logs_enabled() => {
-                    eprintln!("[statix-agent][debug] qemu {label}: {line}");
+                Ok(line) => {
+                    if let Ok(mut logs) = recent_logs.lock() {
+                        if logs.len() == 32 {
+                            logs.pop_front();
+                        }
+                        logs.push_back(format!("{label}: {line}"));
+                    }
+
+                    if verbose_logs_enabled() {
+                        eprintln!("[statix-agent][debug] qemu {label}: {line}");
+                    }
                 }
-                Ok(_) => {}
                 Err(error) => {
                     eprintln!("[statix-agent] qemu {label} log read failed: {error}");
                     break;
@@ -363,11 +409,15 @@ fn verbose_logs_enabled() -> bool {
     )
 }
 
-async fn wait_for_guest_ready(ssh_port: u16, timeout_seconds: u64) -> Result<()> {
+async fn wait_for_guest_ready(qemu: &mut QemuProcess, ssh_port: u16, timeout_seconds: u64) -> Result<()> {
     let deadline = Duration::from_secs(timeout_seconds);
     let start = std::time::Instant::now();
 
     loop {
+        if let Some(status) = qemu.try_wait()? {
+            bail!(qemu.failure_message(status));
+        }
+
         if start.elapsed() >= deadline {
             bail!("microvm did not become ready before timeout");
         }
