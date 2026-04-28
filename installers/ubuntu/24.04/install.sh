@@ -99,6 +99,7 @@ install_dependencies() {
     curl \
     cloud-image-utils \
     iproute2 \
+    lxc \
     pciutils \
     qemu-system-arm \
     qemu-system-x86 \
