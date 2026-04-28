@@ -1,4 +1,5 @@
 use std::{
+    env,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -101,9 +102,15 @@ struct LxcContainer {
 
 impl LxcContainer {
     async fn create(name: String, image: LxcImage, cpu: u8, memory_mb: u32) -> Result<Self> {
+        let lxc_path = lxc_storage_path();
+        fs::create_dir_all(&lxc_path)
+            .with_context(|| format!("failed to create {}", lxc_path.display()))?;
+
         let status = lxc_command("lxc-create")
             .arg("-n")
             .arg(&name)
+            .arg("-P")
+            .arg(&lxc_path)
             .arg("-t")
             .arg("download")
             .arg("--")
@@ -130,6 +137,8 @@ impl LxcContainer {
         let status = lxc_command("lxc-start")
             .arg("-n")
             .arg(&self.name)
+            .arg("-P")
+            .arg(lxc_storage_path())
             .arg("-d")
             .status()
             .await
@@ -142,6 +151,8 @@ impl LxcContainer {
         let status = lxc_command("lxc-wait")
             .arg("-n")
             .arg(&self.name)
+            .arg("-P")
+            .arg(lxc_storage_path())
             .arg("-s")
             .arg("RUNNING")
             .arg("-t")
@@ -228,6 +239,8 @@ impl LxcContainer {
         process
             .arg("-n")
             .arg(&self.name)
+            .arg("-P")
+            .arg(lxc_storage_path())
             .arg("--")
             .arg("sh")
             .arg("-lc")
@@ -249,23 +262,27 @@ impl LxcContainer {
         let _ = lxc_command("lxc-stop")
             .arg("-n")
             .arg(&self.name)
+            .arg("-P")
+            .arg(lxc_storage_path())
             .arg("--kill")
             .status()
             .await;
         let _ = lxc_command("lxc-destroy")
             .arg("-n")
             .arg(&self.name)
+            .arg("-P")
+            .arg(lxc_storage_path())
             .status()
             .await;
         self.destroyed = true;
     }
 
     fn rootfs_path(&self) -> PathBuf {
-        Path::new("/var/lib/lxc").join(&self.name).join("rootfs")
+        lxc_storage_path().join(&self.name).join("rootfs")
     }
 
     fn config_path(&self) -> PathBuf {
-        Path::new("/var/lib/lxc").join(&self.name).join("config")
+        lxc_storage_path().join(&self.name).join("config")
     }
 
     fn apply_limits(&self, cpu: u8, memory_mb: u32) -> Result<()> {
@@ -346,8 +363,34 @@ async fn create_workspace_archive(archive_path: &Path, workdir: &Path) -> Result
 
 fn lxc_command(program: &str) -> TokioCommand {
     let mut command = TokioCommand::new(program);
+    if let Some(home) = lxc_process_home() {
+        command.env("HOME", &home);
+        command.env("XDG_CACHE_HOME", home.join(".cache"));
+        command.env("XDG_CONFIG_HOME", home.join(".config"));
+        command.env("XDG_DATA_HOME", home.join(".local").join("share"));
+    }
     command.kill_on_drop(true);
     command
+}
+
+fn lxc_process_home() -> Option<PathBuf> {
+    env_path("STATIX_AGENT_STATE_DIR")
+        .or_else(|| env_path("STATE_DIRECTORY"))
+        .map(|path| path.join("lxc"))
+}
+
+fn lxc_storage_path() -> PathBuf {
+    lxc_process_home()
+        .map(|path| path.join("containers"))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/lxc"))
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn normalize_release<'a>(distribution: &str, release: &'a str) -> &'a str {
