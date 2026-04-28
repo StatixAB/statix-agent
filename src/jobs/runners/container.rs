@@ -2,6 +2,7 @@ use std::{
     env,
     fs,
     io::Write,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -102,9 +103,12 @@ struct LxcContainer {
 
 impl LxcContainer {
     async fn create(name: String, image: LxcImage, cpu: u8, memory_mb: u32) -> Result<Self> {
+        ensure_lxc_directory_permissions()?;
+
         let lxc_path = lxc_storage_path();
         fs::create_dir_all(&lxc_path)
             .with_context(|| format!("failed to create {}", lxc_path.display()))?;
+        set_traversable_directory(&lxc_path)?;
 
         let log_path = lxc_path.join(format!("{name}.create.log"));
         let status = lxc_command("lxc-create")
@@ -404,6 +408,36 @@ fn lxc_storage_path() -> PathBuf {
     lxc_process_home()
         .map(|path| path.join("containers"))
         .unwrap_or_else(|| PathBuf::from("/var/lib/lxc"))
+}
+
+fn ensure_lxc_directory_permissions() -> Result<()> {
+    let Some(home) = lxc_process_home() else {
+        return Ok(());
+    };
+
+    if let Some(state_dir) = home.parent() {
+        set_traversable_directory(state_dir)?;
+    }
+    fs::create_dir_all(&home).with_context(|| format!("failed to create {}", home.display()))?;
+    set_traversable_directory(&home)?;
+    Ok(())
+}
+
+fn set_traversable_directory(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+
+    let mut permissions = metadata.permissions();
+    let mode = permissions.mode();
+    let traversable_mode = mode | 0o711;
+    if mode != traversable_mode {
+        permissions.set_mode(traversable_mode);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {

@@ -199,10 +199,11 @@ configure_lxc_runtime() {
   [[ -n "$uid_start" && -n "$uid_count" ]] || fail "failed to determine subuid allocation for $SERVICE_USER"
   [[ -n "$gid_start" && -n "$gid_count" ]] || fail "failed to determine subgid allocation for $SERVICE_USER"
 
-  install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_DIR"
-  install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
+  install -d -m 0711 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
+    "$STATE_DIR" \
     "$LXC_HOME" \
-    "$LXC_HOME/containers" \
+    "$LXC_HOME/containers"
+  install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
     "$LXC_HOME/.cache" \
     "$LXC_HOME/.local" \
     "$LXC_HOME/.local/share" \
