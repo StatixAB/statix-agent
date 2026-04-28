@@ -1,9 +1,10 @@
 use std::{
     env, fs,
     io::Write,
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Command as StdCommand,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -86,6 +87,9 @@ impl Runner for ContainerRunner {
             LxcContainer::create(container_name.clone(), image, cpu, memory_mb).await?;
         let result = async {
             container.start().await?;
+            container
+                .configure_guest_network(ctx.timeout_seconds)
+                .await?;
             container.configure_guest_dns(ctx.timeout_seconds).await?;
             container.copy_archive_to_guest(&workspace_tar).await?;
             if let Some(result) = container
@@ -245,6 +249,32 @@ impl LxcContainer {
             "[statix-agent] lxc container {}: configured guest DNS resolvers: {}",
             self.name,
             dns_config.display_nameservers()
+        );
+        Ok(())
+    }
+
+    async fn configure_guest_network(&self, timeout_seconds: u64) -> Result<()> {
+        let Some(network) = lxc_bridge_network() else {
+            eprintln!(
+                "[statix-agent] lxc container {}: could not detect lxc bridge IPv4 network; leaving guest network unchanged",
+                self.name
+            );
+            return Ok(());
+        };
+        let guest_address = guest_ipv4_address(&network, &self.name);
+        let command = guest_network_command(&network, guest_address);
+
+        let output = self.attach_output(timeout_seconds, &command).await?;
+        if !output.status.success() {
+            bail!(
+                "failed to configure lxc container network with {}: {}",
+                output.status,
+                summarize_raw_command_output(&output.stdout, &output.stderr)
+            );
+        }
+        eprintln!(
+            "[statix-agent] lxc container {}: ensured guest IPv4 network {} via {}",
+            self.name, guest_address, network.gateway
         );
         Ok(())
     }
@@ -566,6 +596,65 @@ fn enforce_lxc_limits() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+struct LxcBridgeNetwork {
+    gateway: Ipv4Addr,
+    prefix_len: u8,
+}
+
+fn lxc_bridge_network() -> Option<LxcBridgeNetwork> {
+    let bridge = env::var("STATIX_LXC_NETWORK_BRIDGE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "lxcbr0".to_string());
+    let output = StdCommand::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", &bridge])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_lxc_bridge_network(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_lxc_bridge_network(output: &str) -> Option<LxcBridgeNetwork> {
+    output
+        .split_whitespace()
+        .find_map(|field| field.split_once('/'))
+        .and_then(|(address, prefix)| {
+            let gateway = address.parse::<Ipv4Addr>().ok()?;
+            let prefix_len = prefix.parse::<u8>().ok()?;
+            (prefix_len <= 30).then_some(LxcBridgeNetwork {
+                gateway,
+                prefix_len,
+            })
+        })
+}
+
+fn guest_ipv4_address(network: &LxcBridgeNetwork, container_name: &str) -> Ipv4Addr {
+    let mut octets = network.gateway.octets();
+    let host_octet = 10
+        + (container_name
+            .bytes()
+            .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(byte)))
+            % 240) as u8;
+    if host_octet == octets[3] {
+        octets[3] = host_octet.saturating_add(1);
+    } else {
+        octets[3] = host_octet;
+    }
+    Ipv4Addr::from(octets)
+}
+
+fn guest_network_command(network: &LxcBridgeNetwork, guest_address: Ipv4Addr) -> String {
+    format!(
+        "if ip -4 route show default | grep -q .; then exit 0; fi; iface=$(ip -o link show | awk -F': ' '$2 != \"lo\" {{print $2; exit}}' | cut -d@ -f1); test -n \"$iface\"; ip link set \"$iface\" up; ip -4 addr show dev \"$iface\" | grep -q 'inet ' || ip addr add {guest_address}/{prefix_len} dev \"$iface\"; ip route replace default via {gateway} dev \"$iface\"",
+        prefix_len = network.prefix_len,
+        gateway = network.gateway
+    )
 }
 
 struct ContainerDnsConfig {
@@ -965,6 +1054,30 @@ mod tests {
         let nameservers = parse_configured_nameservers(" 1.1.1.1, 8.8.8.8,1.1.1.1 ");
 
         assert_eq!(nameservers, vec!["1.1.1.1", "8.8.8.8"]);
+    }
+
+    #[test]
+    fn parses_lxc_bridge_network_from_ip_output() {
+        let network = parse_lxc_bridge_network(
+            "3: lxcbr0    inet 10.0.3.1/24 brd 10.0.3.255 scope global lxcbr0",
+        )
+        .expect("bridge network should parse");
+
+        assert_eq!(network.gateway, Ipv4Addr::new(10, 0, 3, 1));
+        assert_eq!(network.prefix_len, 24);
+    }
+
+    #[test]
+    fn builds_guest_network_command() {
+        let network = LxcBridgeNetwork {
+            gateway: Ipv4Addr::new(10, 0, 3, 1),
+            prefix_len: 24,
+        };
+        let command = guest_network_command(&network, Ipv4Addr::new(10, 0, 3, 42));
+
+        assert!(command.contains("ip -4 route show default"));
+        assert!(command.contains("ip addr add 10.0.3.42/24"));
+        assert!(command.contains("ip route replace default via 10.0.3.1"));
     }
 
     #[test]
