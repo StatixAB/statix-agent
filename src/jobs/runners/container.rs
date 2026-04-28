@@ -137,7 +137,7 @@ impl LxcContainer {
         }
 
         let container = Self { name, destroyed: false };
-        container.apply_job_config(cpu, memory_mb)?;
+        container.apply_job_config(cpu, memory_mb, enforce_lxc_limits())?;
         Ok(container)
     }
 
@@ -310,13 +310,13 @@ impl LxcContainer {
         lxc_storage_path().join(&self.name).join("statix-lxc.log")
     }
 
-    fn apply_job_config(&self, cpu: u8, memory_mb: u32) -> Result<()> {
+    fn apply_job_config(&self, cpu: u8, memory_mb: u32, enforce_limits: bool) -> Result<()> {
         let mut config = fs::OpenOptions::new()
             .append(true)
             .open(self.config_path())
             .with_context(|| format!("failed to open lxc config for {}", self.name))?;
 
-        write_job_lxc_config(&mut config, cpu, memory_mb)?;
+        write_job_lxc_config(&mut config, cpu, memory_mb, enforce_limits)?;
         Ok(())
     }
 }
@@ -431,15 +431,28 @@ fn lxc_arch() -> &'static str {
     }
 }
 
-fn write_job_lxc_config(mut writer: impl Write, cpu: u8, memory_mb: u32) -> Result<()> {
-    let memory_bytes = u64::from(memory_mb) * 1024 * 1024;
-    let cpu_quota = u64::from(cpu) * 100_000;
-
+fn write_job_lxc_config(mut writer: impl Write, cpu: u8, memory_mb: u32, enforce_limits: bool) -> Result<()> {
     writeln!(writer, "\n# Statix job runtime config")?;
-    writeln!(writer, "lxc.cgroup2.memory.max = {memory_bytes}")?;
-    writeln!(writer, "lxc.cgroup2.cpu.max = {cpu_quota} 100000")?;
+    if enforce_limits {
+        let memory_bytes = u64::from(memory_mb) * 1024 * 1024;
+        let cpu_quota = u64::from(cpu) * 100_000;
+        writeln!(writer, "lxc.cgroup2.memory.max = {memory_bytes}")?;
+        writeln!(writer, "lxc.cgroup2.cpu.max = {cpu_quota} 100000")?;
+    } else {
+        writeln!(
+            writer,
+            "# cgroup limits requested by Statix are not written by default because unprivileged LXC startup fails on hosts without a fully delegated writable cgroup subtree."
+        )?;
+    }
     writeln!(writer, "lxc.apparmor.profile = unconfined")?;
     Ok(())
+}
+
+fn enforce_lxc_limits() -> bool {
+    env::var("STATIX_LXC_ENFORCE_LIMITS")
+        .ok()
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 fn container_name(attempt_id: &str) -> String {
@@ -559,9 +572,21 @@ mod tests {
     }
 
     #[test]
-    fn writes_job_lxc_config() {
+    fn writes_job_lxc_config_without_limits_by_default() {
         let mut config = Vec::new();
-        write_job_lxc_config(&mut config, 2, 4096).expect("config should be written");
+        write_job_lxc_config(&mut config, 2, 4096, false).expect("config should be written");
+        let config = String::from_utf8(config).expect("config should be utf8");
+
+        assert!(!config.contains("lxc.cgroup2.memory.max"));
+        assert!(!config.contains("lxc.cgroup2.cpu.max"));
+        assert!(config.contains("cgroup limits requested by Statix are not written by default"));
+        assert!(config.contains("lxc.apparmor.profile = unconfined"));
+    }
+
+    #[test]
+    fn writes_job_lxc_config_with_opt_in_limits() {
+        let mut config = Vec::new();
+        write_job_lxc_config(&mut config, 2, 4096, true).expect("config should be written");
         let config = String::from_utf8(config).expect("config should be utf8");
 
         assert!(config.contains("lxc.cgroup2.memory.max = 4294967296"));
