@@ -9,7 +9,14 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates pciutils \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    cloud-image-utils \
+    openssh-client \
+    pciutils \
+    qemu-system-arm \
+    qemu-system-x86 \
+    qemu-utils \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

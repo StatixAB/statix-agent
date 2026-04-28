@@ -201,7 +201,7 @@ async fn create_overlay_disk(base_image: &Path, overlay_image: &Path) -> Result<
         .arg(overlay_image)
         .status()
         .await
-        .context("failed to launch qemu-img")?;
+        .with_context(|| missing_dependency_message("qemu-img", "qemu-utils"))?;
 
     if !status.success() {
         bail!("qemu-img failed to create overlay disk");
@@ -307,7 +307,7 @@ packages:
         .arg(&meta_data_path)
         .status()
         .await
-        .context("failed to launch cloud-localds")?;
+        .with_context(|| missing_dependency_message("cloud-localds", "cloud-image-utils"))?;
 
     let _ = fs::remove_file(user_data_path);
     let _ = fs::remove_file(meta_data_path);
@@ -334,7 +334,9 @@ async fn launch_qemu(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
-    let mut child = command.spawn().context("failed to launch qemu")?;
+    let mut child = command
+        .spawn()
+        .with_context(|| missing_dependency_message(binary, qemu_package_hint()))?;
     spawn_qemu_log_stream("stdout", child.stdout.take(), Arc::clone(&recent_logs));
     spawn_qemu_log_stream("stderr", child.stderr.take(), Arc::clone(&recent_logs));
     Ok(QemuProcess { child: Some(child), recent_logs })
@@ -572,6 +574,20 @@ fn qemu_binary() -> Result<&'static str> {
         "aarch64" => Ok("qemu-system-aarch64"),
         arch => bail!("unsupported host architecture for microvm runner: {arch}"),
     }
+}
+
+fn qemu_package_hint() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "qemu-system-x86",
+        "aarch64" => "qemu-system-arm",
+        _ => "qemu-system",
+    }
+}
+
+fn missing_dependency_message(program: &str, debian_package: &str) -> String {
+    format!(
+        "failed to launch {program}; install the '{debian_package}' package and ensure {program} is on PATH"
+    )
 }
 
 fn canonical_ubuntu_image_url() -> String {
