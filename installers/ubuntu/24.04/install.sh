@@ -218,6 +218,7 @@ configure_lxc_runtime() {
     fi
     printf 'lxc.idmap = u 0 %s %s\n' "$uid_start" "$uid_count"
     printf 'lxc.idmap = g 0 %s %s\n' "$gid_start" "$gid_count"
+    printf 'lxc.apparmor.profile = unconfined\n'
   } >"$lxc_config"
   chown "$SERVICE_USER:$SERVICE_GROUP" "$lxc_config"
   chmod 0640 "$lxc_config"
