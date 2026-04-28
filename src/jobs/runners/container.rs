@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command as StdCommand,
+    process::{Command as StdCommand, Stdio},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,7 +23,6 @@ use crate::{
 const DEFAULT_CPU_COUNT: u8 = 2;
 const DEFAULT_MEMORY_MB: u32 = 4096;
 const WORKSPACE_ARCHIVE: &str = "statix-workspace.tar.gz";
-const GUEST_ARCHIVE_DIR: &str = "/var/lib/statix-agent";
 
 pub struct ContainerRunner {
     image: String,
@@ -92,13 +91,13 @@ impl Runner for ContainerRunner {
                 .configure_guest_network(ctx.timeout_seconds)
                 .await?;
             container.configure_guest_dns(ctx.timeout_seconds).await?;
-            container.copy_archive_to_guest(&workspace_tar).await?;
             if let Some(result) = container
                 .prepare_guest(ctx.timeout_seconds, workspace)
                 .await?
             {
                 return Ok(result);
             }
+            container.copy_archive_to_guest(&workspace_tar).await?;
             container
                 .run_command(ctx.timeout_seconds, command, workspace)
                 .await
@@ -217,22 +216,54 @@ impl LxcContainer {
     }
 
     async fn copy_archive_to_guest(&self, archive_path: &Path) -> Result<()> {
-        let archive_dir = self
-            .rootfs_path()
-            .join(GUEST_ARCHIVE_DIR.trim_start_matches('/'));
-        fs::create_dir_all(&archive_dir).with_context(|| {
+        let archive = fs::read(archive_path).with_context(|| {
             format!(
-                "failed to create guest archive directory {}",
-                archive_dir.display()
+                "failed to read workspace archive {}",
+                archive_path.display()
             )
         })?;
-        let destination = archive_dir.join(WORKSPACE_ARCHIVE);
-        fs::copy(archive_path, &destination).with_context(|| {
+        let mut process = lxc_std_command("lxc-attach");
+        process
+            .arg("-n")
+            .arg(&self.name)
+            .arg("-P")
+            .arg(lxc_storage_path())
+            .arg("--")
+            .arg("sh")
+            .arg("-lc")
+            .arg(format!("cat > /tmp/{WORKSPACE_ARCHIVE}"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = process.spawn().with_context(|| {
             format!(
-                "failed to copy workspace archive into lxc rootfs at {}",
-                destination.display()
+                "failed to start archive copy into lxc container {}",
+                self.name
             )
         })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("failed to open lxc-attach stdin")?;
+        std::thread::spawn(move || {
+            use std::io::Write;
+            stdin.write_all(&archive)
+        })
+        .join()
+        .map_err(|_| anyhow!("archive copy writer thread panicked"))?
+        .context("failed to write workspace archive into lxc container")?;
+
+        let output = child
+            .wait_with_output()
+            .context("failed to wait for workspace archive copy")?;
+        if !output.status.success() {
+            bail!(
+                "failed to copy workspace archive into lxc container with {}: {}",
+                output.status,
+                summarize_raw_command_output(&output.stdout, &output.stderr)
+            );
+        }
         Ok(())
     }
 
@@ -326,8 +357,7 @@ impl LxcContainer {
         workspace: &PreparedWorkspace,
     ) -> Result<JobExecutionResult> {
         let guest_command = format!(
-            "rm -rf /workspace && mkdir -p /workspace && tar -xzf {archive_dir}/{archive} -C /workspace && cd /workspace && exec {command}",
-            archive_dir = GUEST_ARCHIVE_DIR,
+            "rm -rf /workspace && mkdir -p /workspace && tar -xzf /tmp/{archive} -C /workspace && cd /workspace && exec {command}",
             archive = WORKSPACE_ARCHIVE,
             command = shell_join(command)
         );
@@ -409,10 +439,6 @@ impl LxcContainer {
             .status()
             .await;
         self.destroyed = true;
-    }
-
-    fn rootfs_path(&self) -> PathBuf {
-        lxc_storage_path().join(&self.name).join("rootfs")
     }
 
     fn config_path(&self) -> PathBuf {
@@ -504,6 +530,17 @@ fn lxc_command(program: &str) -> TokioCommand {
         command.env("XDG_DATA_HOME", home.join(".local").join("share"));
     }
     command.kill_on_drop(true);
+    command
+}
+
+fn lxc_std_command(program: &str) -> StdCommand {
+    let mut command = StdCommand::new(program);
+    if let Some(home) = lxc_process_home() {
+        command.env("HOME", &home);
+        command.env("XDG_CACHE_HOME", home.join(".cache"));
+        command.env("XDG_CONFIG_HOME", home.join(".config"));
+        command.env("XDG_DATA_HOME", home.join(".local").join("share"));
+    }
     command
 }
 
