@@ -501,11 +501,27 @@ fn lxc_log_excerpt(path: &Path) -> String {
             if log.is_empty() {
                 format!("lxc log {} was empty", path.display())
             } else {
-                truncate_for_log(log, 4_000)
+                tail_for_log(log, 4_000)
             }
         }
         Err(error) => format!("failed to read lxc log {}: {error}", path.display()),
     }
+}
+
+fn tail_for_log(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let tail = value
+        .chars()
+        .rev()
+        .take(max_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("...{tail}")
 }
 
 fn missing_dependency_message(program: &str, debian_package: &str) -> String {
@@ -559,5 +575,11 @@ mod tests {
             shell_join(&["cargo".to_string(), "test".to_string(), "a b".to_string()]),
             "cargo test 'a b'"
         );
+    }
+
+    #[test]
+    fn truncates_lxc_logs_from_the_tail() {
+        assert_eq!(tail_for_log("abcdef", 3), "...def");
+        assert_eq!(tail_for_log("abc", 3), "abc");
     }
 }

@@ -9,6 +9,7 @@ Type=simple
 Environment=STATIX_AGENT_CONFIG=/etc/statix/agent.json
 Environment=STATIX_VERSION_FILE=/opt/statix/version.json
 Environment=STATIX_APPLY_WIREGUARD=0
+Environment=XDG_RUNTIME_DIR=/run/statix-agent
 EnvironmentFile=-/etc/statix/agent.env
 ExecStart=/usr/local/bin/statix run
 Restart=always
@@ -20,8 +21,10 @@ User=statix-agent
 Group=statix-agent
 
 # LXC jobs run as unprivileged containers, but LXC still needs namespace
-# creation and the setuid uidmap helpers for the configured subordinate IDs.
+# creation, writable delegated cgroups, and the setuid uidmap helpers for the
+# configured subordinate IDs.
 NoNewPrivileges=false
+Delegate=yes
 PrivateTmp=true
 PrivateDevices=false
 ProtectHome=read-only
@@ -39,6 +42,7 @@ SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 ReadOnlyPaths=/etc/statix /opt/statix
 RuntimeDirectory=statix-agent
+RuntimeDirectoryMode=0700
 StateDirectory=statix-agent
 
 [Install]
