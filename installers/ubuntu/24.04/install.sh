@@ -94,6 +94,16 @@ check_platform() {
   fi
 }
 
+check_proc_mount_options() {
+  local proc_options
+  proc_options="$(findmnt -no OPTIONS /proc 2>/dev/null || true)"
+
+  if [[ ",$proc_options," == *",noatime,"* ]]; then
+    log "warning: /proc is mounted with noatime; unprivileged LXC may fail to mount proc inside job containers"
+    log "warning: remount /proc with relatime and update /etc/fstab before running container jobs"
+  fi
+}
+
 install_dependencies() {
   command -v apt-get >/dev/null 2>&1 || fail "apt-get is required"
 
@@ -352,6 +362,7 @@ main() {
   require_sudo
   normalize_download_base_url
   check_platform
+  check_proc_mount_options
   install_dependencies
   ensure_service_account
   configure_lxc_runtime

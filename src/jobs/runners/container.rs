@@ -557,17 +557,56 @@ fn lxc_log_excerpt(path: &Path) -> String {
 }
 
 fn lxc_start_failure_message(log_excerpt: &str) -> String {
+    lxc_start_failure_message_with_host_context(log_excerpt, proc_mount_uses_noatime())
+}
+
+fn lxc_start_failure_message_with_host_context(log_excerpt: &str, proc_uses_noatime: Option<bool>) -> String {
     if log_excerpt.contains("Failed to mount \"proc\"")
         && log_excerpt.contains("/usr/lib/")
         && log_excerpt.contains("/lxc/rootfs/proc")
         && log_excerpt.contains("Operation not permitted")
     {
-        format!(
+        let mut message = format!(
             "{log_excerpt}\nHint: LXC needs write access to its package rootfs mountpoint under /usr/lib/*/lxc/rootfs. If statix-agent is running under systemd with ProtectSystem=strict, add ReadWritePaths for the distro multiarch LXC rootfs path and restart the service."
-        )
+        );
+        match proc_uses_noatime {
+            Some(true) => message.push_str(
+                " The statix-agent process also sees /proc mounted with noatime; unprivileged LXC can fail to mount proc from that parent mount. Remount /proc with relatime and make the matching /etc/fstab change persistent.",
+            ),
+            Some(false) => message.push_str(
+                " If ReadWritePaths is already applied, check the host /proc mount options with `findmnt -no OPTIONS /proc`; unprivileged LXC can fail when /proc is mounted with noatime instead of relatime.",
+            ),
+            None => message.push_str(
+                " If ReadWritePaths is already applied, check the host /proc mount options; unprivileged LXC can fail when /proc is mounted with noatime instead of relatime.",
+            ),
+        }
+        message
     } else {
         log_excerpt.to_string()
     }
+}
+
+fn proc_mount_uses_noatime() -> Option<bool> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut found_proc = false;
+
+    for line in mountinfo.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.get(4) != Some(&"/proc") {
+            continue;
+        }
+        found_proc = true;
+
+        if fields
+            .get(5)
+            .map(|options| options.split(',').any(|option| option == "noatime"))
+            .unwrap_or(false)
+        {
+            return Some(true);
+        }
+    }
+
+    found_proc.then_some(false)
 }
 
 fn tail_for_log(value: &str, max_chars: usize) -> String {
@@ -660,10 +699,20 @@ mod tests {
     #[test]
     fn adds_hint_for_lxc_proc_mount_denial_under_package_rootfs() {
         let log = "Operation not permitted - Failed to mount \"proc\" onto \"/usr/lib/x86_64-linux-gnu/lxc/rootfs/proc\"";
-        let message = lxc_start_failure_message(log);
+        let message = lxc_start_failure_message_with_host_context(log, Some(false));
 
         assert!(message.contains(log));
         assert!(message.contains("ReadWritePaths"));
         assert!(message.contains("/usr/lib/*/lxc/rootfs"));
+        assert!(message.contains("findmnt -no OPTIONS /proc"));
+    }
+
+    #[test]
+    fn adds_noatime_hint_when_proc_parent_mount_uses_noatime() {
+        let log = "Operation not permitted - Failed to mount \"proc\" onto \"/usr/lib/x86_64-linux-gnu/lxc/rootfs/proc\"";
+        let message = lxc_start_failure_message_with_host_context(log, Some(true));
+
+        assert!(message.contains("noatime"));
+        assert!(message.contains("relatime"));
     }
 }
