@@ -18,6 +18,12 @@ SERVICE_PATH="${STATIX_SERVICE_PATH:-/etc/systemd/system/$SERVICE_NAME.service}"
 UPDATE_SCRIPT_PATH="${STATIX_UPDATE_SCRIPT_PATH:-/usr/local/lib/statix/update.sh}"
 UPDATE_SERVICE_PATH="${STATIX_UPDATE_SERVICE_PATH:-/etc/systemd/system/$SERVICE_NAME-update.service}"
 SUDOERS_PATH="${STATIX_AGENT_SUDOERS_PATH:-/etc/sudoers.d/$SERVICE_NAME}"
+STATE_DIR="${STATIX_AGENT_STATE_DIR:-/var/lib/statix-agent}"
+LXC_HOME="${STATIX_LXC_HOME:-$STATE_DIR/lxc}"
+LXC_SUBID_START="${STATIX_LXC_SUBID_START:-100000}"
+LXC_SUBID_COUNT="${STATIX_LXC_SUBID_COUNT:-65536}"
+LXC_NETWORK_BRIDGE="${STATIX_LXC_NETWORK_BRIDGE:-lxcbr0}"
+LXC_USERNET_DEVICES="${STATIX_LXC_USERNET_DEVICES:-10}"
 API_BASE_URL="${STATIX_API_BASE_URL:-}"
 NODE_NAME="${STATIX_NODE_NAME:-}"
 SKIP_LOGIN="${STATIX_SKIP_LOGIN:-0}"
@@ -105,6 +111,7 @@ install_dependencies() {
     qemu-system-x86 \
     qemu-utils \
     openssh-client \
+    uidmap \
     wireguard-tools
 }
 
@@ -145,6 +152,81 @@ ensure_service_account() {
       --no-create-home \
       --shell /usr/sbin/nologin \
       "$SERVICE_USER"
+  fi
+}
+
+has_subid_allocation() {
+  local file="$1"
+
+  [[ -r "$file" ]] || return 1
+  awk -F: -v user="$SERVICE_USER" '$1 == user { found = 1 } END { exit found ? 0 : 1 }' "$file"
+}
+
+subid_value() {
+  local file="$1"
+  local field="$2"
+
+  awk -F: -v user="$SERVICE_USER" -v field="$field" '$1 == user { print $field; exit }' "$file"
+}
+
+ensure_lxc_subids() {
+  local subid_end
+  subid_end=$((LXC_SUBID_START + LXC_SUBID_COUNT - 1))
+
+  if ! has_subid_allocation /etc/subuid; then
+    log "allocating subuids $LXC_SUBID_START-$subid_end for $SERVICE_USER"
+    usermod --add-subuids "$LXC_SUBID_START-$subid_end" "$SERVICE_USER"
+  fi
+
+  if ! has_subid_allocation /etc/subgid; then
+    log "allocating subgids $LXC_SUBID_START-$subid_end for $SERVICE_USER"
+    usermod --add-subgids "$LXC_SUBID_START-$subid_end" "$SERVICE_USER"
+  fi
+}
+
+configure_lxc_runtime() {
+  local lxc_config_dir lxc_config lxc_usernet_line uid_start uid_count gid_start gid_count
+  lxc_config_dir="$LXC_HOME/.config/lxc"
+  lxc_config="$lxc_config_dir/default.conf"
+  lxc_usernet_line="$SERVICE_USER veth $LXC_NETWORK_BRIDGE $LXC_USERNET_DEVICES"
+
+  ensure_lxc_subids
+  uid_start="$(subid_value /etc/subuid 2)"
+  uid_count="$(subid_value /etc/subuid 3)"
+  gid_start="$(subid_value /etc/subgid 2)"
+  gid_count="$(subid_value /etc/subgid 3)"
+
+  [[ -n "$uid_start" && -n "$uid_count" ]] || fail "failed to determine subuid allocation for $SERVICE_USER"
+  [[ -n "$gid_start" && -n "$gid_count" ]] || fail "failed to determine subgid allocation for $SERVICE_USER"
+
+  install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_DIR"
+  install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
+    "$LXC_HOME" \
+    "$LXC_HOME/containers" \
+    "$LXC_HOME/.cache" \
+    "$LXC_HOME/.local" \
+    "$LXC_HOME/.local/share" \
+    "$lxc_config_dir"
+
+  {
+    if [[ -r /etc/lxc/default.conf ]]; then
+      printf 'lxc.include = /etc/lxc/default.conf\n'
+    else
+      printf 'lxc.net.0.type = veth\n'
+      printf 'lxc.net.0.link = %s\n' "$LXC_NETWORK_BRIDGE"
+      printf 'lxc.net.0.flags = up\n'
+    fi
+    printf 'lxc.idmap = u 0 %s %s\n' "$uid_start" "$uid_count"
+    printf 'lxc.idmap = g 0 %s %s\n' "$gid_start" "$gid_count"
+  } >"$lxc_config"
+  chown "$SERVICE_USER:$SERVICE_GROUP" "$lxc_config"
+  chmod 0640 "$lxc_config"
+
+  install -d -m 0755 /etc/lxc
+  touch /etc/lxc/lxc-usernet
+  if ! grep -Fxq "$lxc_usernet_line" /etc/lxc/lxc-usernet; then
+    log "allowing $SERVICE_USER to attach LXC veth devices to $LXC_NETWORK_BRIDGE"
+    printf '%s\n' "$lxc_usernet_line" >>/etc/lxc/lxc-usernet
   fi
 }
 
@@ -270,6 +352,7 @@ main() {
   check_platform
   install_dependencies
   ensure_service_account
+  configure_lxc_runtime
   install_agent_binary
   install_version_file
   install_update_script

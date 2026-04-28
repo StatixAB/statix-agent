@@ -19,21 +19,22 @@ TimeoutStopSec=20s
 User=statix-agent
 Group=statix-agent
 
-# Run the main agent unprivileged; privileged actions should be delegated to narrow helpers.
-NoNewPrivileges=true
+# LXC jobs run as unprivileged containers, but LXC still needs namespace
+# creation and the setuid uidmap helpers for the configured subordinate IDs.
+NoNewPrivileges=false
 PrivateTmp=true
-PrivateDevices=true
+PrivateDevices=false
 ProtectHome=read-only
 ProtectSystem=strict
-ProtectControlGroups=true
+ProtectControlGroups=false
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectClock=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-RestrictSUIDSGID=true
+RestrictSUIDSGID=false
 RestrictRealtime=true
-RestrictNamespaces=true
+RestrictNamespaces=false
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 ReadOnlyPaths=/etc/statix /opt/statix
