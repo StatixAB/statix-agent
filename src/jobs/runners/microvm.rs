@@ -498,17 +498,9 @@ async fn wait_for_guest_ready(
 
         let remaining = deadline.saturating_sub(start.elapsed());
         let mut probe = TokioCommand::new("ssh");
+        probe.arg("-i").arg(private_key);
+        add_common_ssh_options(&mut probe, 3);
         probe
-            .arg("-i")
-            .arg(private_key)
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg("-o")
-            .arg("ConnectTimeout=3")
-            .arg("-o")
-            .arg("StrictHostKeyChecking=no")
-            .arg("-o")
-            .arg("UserKnownHostsFile=/dev/null")
             .arg("-p")
             .arg(ssh_port.to_string())
             .arg(format!("{}@127.0.0.1", DEFAULT_SSH_USER))
@@ -519,18 +511,7 @@ async fn wait_for_guest_ready(
         let last_probe_failure =
             match timeout(remaining.min(Duration::from_secs(5)), probe.output()).await {
             Ok(Ok(output)) if output.status.success() => return Ok(()),
-            Ok(Ok(output)) => {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                if stderr.is_empty() {
-                    format!("ssh readiness probe exited with {}", output.status)
-                } else {
-                    format!(
-                        "ssh readiness probe exited with {}: {}",
-                        output.status,
-                        truncate_for_log(&stderr, 240)
-                    )
-                }
-            }
+            Ok(Ok(output)) => readiness_probe_failure(&output),
             Ok(Err(error)) => format!("failed to launch ssh readiness probe: {error}"),
             Err(_) => "ssh readiness probe timed out".to_string(),
             };
@@ -565,16 +546,9 @@ async fn run_guest_command(
         Duration::from_secs(timeout_seconds),
         async {
             let mut scp = TokioCommand::new("scp");
-            scp.arg("-i")
-                .arg(private_key)
-                .arg("-o")
-                .arg("BatchMode=yes")
-                .arg("-o")
-                .arg("ConnectTimeout=5")
-                .arg("-o")
-                .arg("StrictHostKeyChecking=no")
-                .arg("-o")
-                .arg("UserKnownHostsFile=/dev/null")
+            scp.arg("-i").arg(private_key);
+            add_common_ssh_options(&mut scp, 5);
+            scp
                 .arg("-P")
                 .arg(ssh_port.to_string())
                 .arg(workspace_tar)
@@ -616,16 +590,9 @@ async fn run_guest_command(
         Duration::from_secs(timeout_seconds),
         async {
             let mut ssh = TokioCommand::new("ssh");
-            ssh.arg("-i")
-                .arg(private_key)
-                .arg("-o")
-                .arg("BatchMode=yes")
-                .arg("-o")
-                .arg("ConnectTimeout=5")
-                .arg("-o")
-                .arg("StrictHostKeyChecking=no")
-                .arg("-o")
-                .arg("UserKnownHostsFile=/dev/null")
+            ssh.arg("-i").arg(private_key);
+            add_common_ssh_options(&mut ssh, 5);
+            ssh
                 .arg("-p")
                 .arg(ssh_port.to_string())
                 .arg(format!("{}@127.0.0.1", DEFAULT_SSH_USER))
@@ -649,6 +616,43 @@ async fn run_guest_command(
         eprintln!("[statix-agent] microvm command failed with {}", output.status);
         Ok(JobExecutionResult { status: "failed", message: Some(message) })
     }
+}
+
+fn add_common_ssh_options(command: &mut TokioCommand, connect_timeout_seconds: u64) {
+    command
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg(format!("ConnectTimeout={connect_timeout_seconds}"))
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("LogLevel=ERROR");
+}
+
+fn readiness_probe_failure(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if output.status.code() == Some(1) && readiness_stderr_is_non_actionable(&stderr) {
+        return "ssh is reachable; waiting for cloud-init boot-finished marker".to_string();
+    }
+
+    if stderr.is_empty() {
+        format!("ssh readiness probe exited with {}", output.status)
+    } else {
+        format!(
+            "ssh readiness probe exited with {}: {}",
+            output.status,
+            truncate_for_log(&stderr, 240)
+        )
+    }
+}
+
+fn readiness_stderr_is_non_actionable(stderr: &str) -> bool {
+    stderr.is_empty() || stderr.starts_with("Warning: Permanently added ")
 }
 
 fn truncate_for_log(value: &str, max_chars: usize) -> String {
@@ -753,5 +757,16 @@ mod tests {
             .map(String::from)
             .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn readiness_known_host_warning_is_non_actionable() {
+        assert!(readiness_stderr_is_non_actionable(""));
+        assert!(readiness_stderr_is_non_actionable(
+            "Warning: Permanently added '[127.0.0.1]:2222' (ED25519) to the list of known hosts."
+        ));
+        assert!(!readiness_stderr_is_non_actionable(
+            "Permission denied (publickey)."
+        ));
     }
 }
