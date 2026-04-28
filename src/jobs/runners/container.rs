@@ -574,10 +574,10 @@ fn lxc_start_failure_message_with_host_context(log_excerpt: &str, proc_uses_noat
                 " The statix-agent process also sees /proc mounted with noatime; unprivileged LXC can fail to mount proc from that parent mount. Remount /proc with relatime and make the matching /etc/fstab change persistent.",
             ),
             Some(false) => message.push_str(
-                " If ReadWritePaths is already applied, check the host /proc mount options with `findmnt -no OPTIONS /proc`; unprivileged LXC can fail when /proc is mounted with noatime instead of relatime.",
+                " If ReadWritePaths is already applied, check whether systemd ProtectKernelTunables is enabled for statix-agent; it can make proc/sys paths read-only in the service mount namespace and block LXC's procfs mount. Also check the host /proc mount options with `findmnt -no OPTIONS /proc`; unprivileged LXC can fail when /proc is mounted with noatime instead of relatime.",
             ),
             None => message.push_str(
-                " If ReadWritePaths is already applied, check the host /proc mount options; unprivileged LXC can fail when /proc is mounted with noatime instead of relatime.",
+                " If ReadWritePaths is already applied, check whether systemd ProtectKernelTunables is enabled for statix-agent; it can make proc/sys paths read-only in the service mount namespace and block LXC's procfs mount. Also check the host /proc mount options; unprivileged LXC can fail when /proc is mounted with noatime instead of relatime.",
             ),
         }
         message
@@ -704,6 +704,7 @@ mod tests {
         assert!(message.contains(log));
         assert!(message.contains("ReadWritePaths"));
         assert!(message.contains("/usr/lib/*/lxc/rootfs"));
+        assert!(message.contains("ProtectKernelTunables"));
         assert!(message.contains("findmnt -no OPTIONS /proc"));
     }
 

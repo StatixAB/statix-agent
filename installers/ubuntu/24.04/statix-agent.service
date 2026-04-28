@@ -34,7 +34,10 @@ ProtectSystem=strict
 # rest of /usr is read-only in the service mount namespace.
 ReadWritePaths=-/usr/lib/x86_64-linux-gnu/lxc/rootfs -/usr/lib/aarch64-linux-gnu/lxc/rootfs
 ProtectControlGroups=false
-ProtectKernelTunables=true
+# LXC must mount procfs/sysfs for job containers. Making kernel tunables
+# read-only in the agent's own mount namespace can make the container's procfs
+# mount look less restrictive and fail with EPERM.
+ProtectKernelTunables=false
 ProtectKernelModules=true
 ProtectClock=true
 LockPersonality=true
