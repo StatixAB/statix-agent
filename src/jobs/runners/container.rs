@@ -106,11 +106,16 @@ impl LxcContainer {
         fs::create_dir_all(&lxc_path)
             .with_context(|| format!("failed to create {}", lxc_path.display()))?;
 
+        let log_path = lxc_path.join(format!("{name}.create.log"));
         let status = lxc_command("lxc-create")
             .arg("-n")
             .arg(&name)
             .arg("-P")
             .arg(&lxc_path)
+            .arg("--logfile")
+            .arg(&log_path)
+            .arg("--logpriority")
+            .arg("DEBUG")
             .arg("-t")
             .arg("download")
             .arg("--")
@@ -125,7 +130,10 @@ impl LxcContainer {
             .with_context(|| missing_dependency_message("lxc-create", "lxc"))?;
 
         if !status.success() {
-            bail!("lxc-create failed for container {name} with {status}");
+            bail!(
+                "lxc-create failed for container {name} with {status}: {}",
+                lxc_log_excerpt(&log_path)
+            );
         }
 
         let container = Self { name, destroyed: false };
@@ -134,18 +142,27 @@ impl LxcContainer {
     }
 
     async fn start(&mut self) -> Result<()> {
+        let log_path = self.log_path();
         let status = lxc_command("lxc-start")
             .arg("-n")
             .arg(&self.name)
             .arg("-P")
             .arg(lxc_storage_path())
+            .arg("--logfile")
+            .arg(&log_path)
+            .arg("--logpriority")
+            .arg("DEBUG")
             .arg("-d")
             .status()
             .await
             .with_context(|| missing_dependency_message("lxc-start", "lxc"))?;
 
         if !status.success() {
-            bail!("lxc-start failed for container {} with {status}", self.name);
+            bail!(
+                "lxc-start failed for container {} with {status}: {}",
+                self.name,
+                lxc_log_excerpt(&log_path)
+            );
         }
 
         let status = lxc_command("lxc-wait")
@@ -162,7 +179,11 @@ impl LxcContainer {
             .with_context(|| missing_dependency_message("lxc-wait", "lxc"))?;
 
         if !status.success() {
-            bail!("lxc-wait did not observe container {} running: {status}", self.name);
+            bail!(
+                "lxc-wait did not observe container {} running: {status}: {}",
+                self.name,
+                lxc_log_excerpt(&log_path)
+            );
         }
 
         Ok(())
@@ -283,6 +304,10 @@ impl LxcContainer {
 
     fn config_path(&self) -> PathBuf {
         lxc_storage_path().join(&self.name).join("config")
+    }
+
+    fn log_path(&self) -> PathBuf {
+        lxc_storage_path().join(&self.name).join("statix-lxc.log")
     }
 
     fn apply_limits(&self, cpu: u8, memory_mb: u32) -> Result<()> {
@@ -460,6 +485,20 @@ fn truncate_for_log(value: &str, max_chars: usize) -> String {
     let mut shortened = value.chars().take(max_chars).collect::<String>();
     shortened.push_str("...");
     shortened
+}
+
+fn lxc_log_excerpt(path: &Path) -> String {
+    match fs::read_to_string(path) {
+        Ok(log) => {
+            let log = log.trim();
+            if log.is_empty() {
+                format!("lxc log {} was empty", path.display())
+            } else {
+                truncate_for_log(log, 4_000)
+            }
+        }
+        Err(error) => format!("failed to read lxc log {}: {error}", path.display()),
+    }
 }
 
 fn missing_dependency_message(program: &str, debian_package: &str) -> String {
