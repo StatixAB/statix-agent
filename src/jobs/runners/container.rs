@@ -254,7 +254,14 @@ impl LxcContainer {
         timeout_seconds: u64,
         workspace: &PreparedWorkspace,
     ) -> Result<Option<JobExecutionResult>> {
-        let setup_command = "command -v cargo >/dev/null 2>&1 || (apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates cargo git libssl-dev pkg-config)";
+        let setup_command = concat!(
+            "echo '[statix-agent] guest network diagnostics:'; ",
+            "echo '[statix-agent] ip addr:'; ip addr || true; ",
+            "echo '[statix-agent] ip route:'; ip route || true; ",
+            "echo '[statix-agent] /etc/resolv.conf:'; cat /etc/resolv.conf || true; ",
+            "command -v cargo >/dev/null 2>&1 || ",
+            "(apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates cargo git libssl-dev pkg-config)"
+        );
         let output = self.attach_output(timeout_seconds, setup_command).await?;
         if !output.status.success() {
             let message =
