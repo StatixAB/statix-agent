@@ -1,6 +1,5 @@
 use std::{
-    env,
-    fs,
+    env, fs,
     io::Write,
     net::IpAddr,
     os::unix::fs::PermissionsExt,
@@ -15,7 +14,9 @@ use tokio::{
 
 use crate::{
     config::agent_state_dir,
-    jobs::{ExecutionContext, JobExecutionResult, PreparedWorkspace, Runner, summarize_command_output},
+    jobs::{
+        ExecutionContext, JobExecutionResult, PreparedWorkspace, Runner, summarize_command_output,
+    },
 };
 
 const DEFAULT_CPU_COUNT: u8 = 2;
@@ -30,7 +31,11 @@ pub struct ContainerRunner {
 
 impl ContainerRunner {
     pub fn new(image: String, cpu: Option<u8>, memory_mb: Option<u32>) -> Self {
-        Self { image, cpu, memory_mb }
+        Self {
+            image,
+            cpu,
+            memory_mb,
+        }
     }
 }
 
@@ -57,7 +62,8 @@ impl Runner for ContainerRunner {
             .join("container")
             .join(&ctx.job_id)
             .join(&ctx.attempt_id);
-        fs::create_dir_all(&runtime_root).with_context(|| format!("failed to create {}", runtime_root.display()))?;
+        fs::create_dir_all(&runtime_root)
+            .with_context(|| format!("failed to create {}", runtime_root.display()))?;
 
         eprintln!(
             "[statix-agent] job {}: preparing lxc container {} from {}",
@@ -76,15 +82,21 @@ impl Runner for ContainerRunner {
             workspace.workdir.display()
         );
 
-        let mut container = LxcContainer::create(container_name.clone(), image, cpu, memory_mb).await?;
+        let mut container =
+            LxcContainer::create(container_name.clone(), image, cpu, memory_mb).await?;
         let result = async {
             container.start().await?;
             container.configure_guest_dns(ctx.timeout_seconds).await?;
             container.copy_archive_to_guest(&workspace_tar).await?;
-            if let Some(result) = container.prepare_guest(ctx.timeout_seconds, workspace).await? {
+            if let Some(result) = container
+                .prepare_guest(ctx.timeout_seconds, workspace)
+                .await?
+            {
                 return Ok(result);
             }
-            container.run_command(ctx.timeout_seconds, command, workspace).await
+            container
+                .run_command(ctx.timeout_seconds, command, workspace)
+                .await
         }
         .await;
 
@@ -142,7 +154,10 @@ impl LxcContainer {
             );
         }
 
-        let container = Self { name, destroyed: false };
+        let container = Self {
+            name,
+            destroyed: false,
+        };
         container.apply_job_config(cpu, memory_mb, enforce_lxc_limits())?;
         Ok(container)
     }
@@ -208,8 +223,8 @@ impl LxcContainer {
     }
 
     async fn configure_guest_dns(&self, timeout_seconds: u64) -> Result<()> {
-        let nameservers = container_nameservers();
-        if nameservers.is_empty() {
+        let dns_config = container_dns_config();
+        if dns_config.nameservers.is_empty() && !dns_config.include_default_gateway {
             eprintln!(
                 "[statix-agent] lxc container {}: no non-loopback DNS resolvers found for guest",
                 self.name
@@ -217,7 +232,7 @@ impl LxcContainer {
             return Ok(());
         }
 
-        let command = guest_resolv_conf_command(&nameservers);
+        let command = guest_resolv_conf_command(&dns_config);
         let output = self.attach_output(timeout_seconds, &command).await?;
         if !output.status.success() {
             bail!(
@@ -229,7 +244,7 @@ impl LxcContainer {
         eprintln!(
             "[statix-agent] lxc container {}: configured guest DNS resolvers: {}",
             self.name,
-            nameservers.join(", ")
+            dns_config.display_nameservers()
         );
         Ok(())
     }
@@ -242,7 +257,8 @@ impl LxcContainer {
         let setup_command = "command -v cargo >/dev/null 2>&1 || (apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates cargo git libssl-dev pkg-config)";
         let output = self.attach_output(timeout_seconds, setup_command).await?;
         if !output.status.success() {
-            let message = summarize_command_output(&workspace.workdir, &output.stdout, &output.stderr);
+            let message =
+                summarize_command_output(&workspace.workdir, &output.stdout, &output.stderr);
             eprintln!(
                 "[statix-agent] lxc container setup failed with {}; output: {}",
                 output.status,
@@ -278,18 +294,28 @@ impl LxcContainer {
 
         if output.status.success() {
             eprintln!("[statix-agent] lxc container command succeeded");
-            Ok(JobExecutionResult { status: "succeeded", message: Some(message) })
+            Ok(JobExecutionResult {
+                status: "succeeded",
+                message: Some(message),
+            })
         } else {
             eprintln!(
                 "[statix-agent] lxc container command failed with {}; output: {}",
                 output.status,
                 truncate_for_log(&message, 1_000)
             );
-            Ok(JobExecutionResult { status: "failed", message: Some(message) })
+            Ok(JobExecutionResult {
+                status: "failed",
+                message: Some(message),
+            })
         }
     }
 
-    async fn attach_output(&self, timeout_seconds: u64, shell_command: &str) -> Result<std::process::Output> {
+    async fn attach_output(
+        &self,
+        timeout_seconds: u64,
+        shell_command: &str,
+    ) -> Result<std::process::Output> {
         let mut process = lxc_command("lxc-attach");
         process
             .arg("-n")
@@ -306,7 +332,12 @@ impl LxcContainer {
             .await
             .map_err(|_| anyhow!("lxc command timed out after {} seconds", timeout_seconds))?
             .map_err(anyhow::Error::from)
-            .map_err(|error| error.context(format!("failed to execute command inside lxc container {}", self.name)))
+            .map_err(|error| {
+                error.context(format!(
+                    "failed to execute command inside lxc container {}",
+                    self.name
+                ))
+            })
     }
 
     async fn destroy(&mut self) {
@@ -454,7 +485,8 @@ fn ensure_lxc_directory_permissions() -> Result<()> {
 }
 
 fn set_traversable_directory(path: &Path) -> Result<()> {
-    let metadata = fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
     if !metadata.is_dir() {
         return Ok(());
     }
@@ -495,7 +527,12 @@ fn lxc_arch() -> &'static str {
     }
 }
 
-fn write_job_lxc_config(mut writer: impl Write, cpu: u8, memory_mb: u32, enforce_limits: bool) -> Result<()> {
+fn write_job_lxc_config(
+    mut writer: impl Write,
+    cpu: u8,
+    memory_mb: u32,
+    enforce_limits: bool,
+) -> Result<()> {
     writeln!(writer, "\n# Statix job runtime config")?;
     if enforce_limits {
         let memory_bytes = u64::from(memory_mb) * 1024 * 1024;
@@ -515,17 +552,41 @@ fn write_job_lxc_config(mut writer: impl Write, cpu: u8, memory_mb: u32, enforce
 fn enforce_lxc_limits() -> bool {
     env::var("STATIX_LXC_ENFORCE_LIMITS")
         .ok()
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
-fn container_nameservers() -> Vec<String> {
+struct ContainerDnsConfig {
+    nameservers: Vec<String>,
+    include_default_gateway: bool,
+}
+
+impl ContainerDnsConfig {
+    fn display_nameservers(&self) -> String {
+        let mut nameservers = Vec::new();
+        if self.include_default_gateway {
+            nameservers.push("guest default gateway".to_string());
+        }
+        nameservers.extend(self.nameservers.iter().cloned());
+        nameservers.join(", ")
+    }
+}
+
+fn container_dns_config() -> ContainerDnsConfig {
     let configured = env::var("STATIX_CONTAINER_DNS")
         .ok()
         .map(|value| parse_configured_nameservers(&value))
         .unwrap_or_default();
     if !configured.is_empty() {
-        return configured;
+        return ContainerDnsConfig {
+            nameservers: configured,
+            include_default_gateway: false,
+        };
     }
 
     let mut nameservers = Vec::new();
@@ -535,11 +596,17 @@ fn container_nameservers() -> Vec<String> {
         };
         nameservers.extend(parse_resolv_conf_nameservers(&contents));
         if !nameservers.is_empty() {
-            return dedupe_nameservers(nameservers);
+            return ContainerDnsConfig {
+                nameservers: dedupe_nameservers(nameservers),
+                include_default_gateway: true,
+            };
         }
     }
 
-    Vec::new()
+    ContainerDnsConfig {
+        nameservers: Vec::new(),
+        include_default_gateway: true,
+    }
 }
 
 fn parse_configured_nameservers(value: &str) -> Vec<String> {
@@ -584,14 +651,24 @@ fn dedupe_nameservers(nameservers: Vec<String>) -> Vec<String> {
     deduped
 }
 
-fn guest_resolv_conf_command(nameservers: &[String]) -> String {
+fn guest_resolv_conf_command(config: &ContainerDnsConfig) -> String {
     let mut lines = vec!["# Generated by statix-agent for job container DNS".to_string()];
-    lines.extend(nameservers.iter().map(|nameserver| format!("nameserver {nameserver}")));
+    lines.extend(
+        config
+            .nameservers
+            .iter()
+            .map(|nameserver| format!("nameserver {nameserver}")),
+    );
     lines.push("options timeout:2 attempts:2".to_string());
 
+    let write_resolv_conf = format!("printf '%s\\n' {} > /etc/resolv.conf", shell_join(&lines));
+    if !config.include_default_gateway {
+        return format!("rm -f /etc/resolv.conf && {write_resolv_conf}");
+    }
+
     format!(
-        "rm -f /etc/resolv.conf && printf '%s\\n' {} > /etc/resolv.conf",
-        shell_join(&lines)
+        "gateway=$(ip -4 route show default 2>/dev/null | awk '{{print $3; exit}}'); rm -f /etc/resolv.conf && {{ printf '%s\\n' '# Generated by statix-agent for job container DNS'; if [ -n \"$gateway\" ]; then printf '%s\\n' \"nameserver $gateway\"; fi; printf '%s\\n' {}; }} > /etc/resolv.conf",
+        shell_join(&lines[1..])
     )
 }
 
@@ -620,7 +697,11 @@ fn container_name(attempt_id: &str) -> String {
         .trim_matches('-')
         .to_string();
 
-    let suffix = if suffix.is_empty() { "job".to_string() } else { suffix };
+    let suffix = if suffix.is_empty() {
+        "job".to_string()
+    } else {
+        suffix
+    };
     format!("statix-{}", truncate_for_name(&suffix, 56))
 }
 
@@ -641,7 +722,10 @@ fn shell_escape(value: &str) -> String {
         return "''".to_string();
     }
 
-    if value.chars().all(|character| character.is_ascii_alphanumeric() || "@%_-+=:,./".contains(character)) {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "@%_-+=:,./".contains(character))
+    {
         return value.to_string();
     }
 
@@ -685,7 +769,10 @@ fn lxc_start_failure_message(log_excerpt: &str) -> String {
     lxc_start_failure_message_with_host_context(log_excerpt, proc_mount_uses_noatime())
 }
 
-fn lxc_start_failure_message_with_host_context(log_excerpt: &str, proc_uses_noatime: Option<bool>) -> String {
+fn lxc_start_failure_message_with_host_context(
+    log_excerpt: &str,
+    proc_uses_noatime: Option<bool>,
+) -> String {
     if log_excerpt.contains("Failed to mount \"proc\"")
         && log_excerpt.contains("/usr/lib/")
         && log_excerpt.contains("/lxc/rootfs/proc")
@@ -874,12 +961,28 @@ mod tests {
     }
 
     #[test]
-    fn builds_guest_resolv_conf_command() {
-        let command = guest_resolv_conf_command(&["192.0.2.53".to_string(), "2001:db8::53".to_string()]);
+    fn builds_guest_resolv_conf_command_with_default_gateway_first() {
+        let command = guest_resolv_conf_command(&ContainerDnsConfig {
+            nameservers: vec!["192.0.2.53".to_string(), "2001:db8::53".to_string()],
+            include_default_gateway: true,
+        });
 
         assert_eq!(
             command,
-            "rm -f /etc/resolv.conf && printf '%s\\n' '# Generated by statix-agent for job container DNS' 'nameserver 192.0.2.53' 'nameserver 2001:db8::53' 'options timeout:2 attempts:2' > /etc/resolv.conf"
+            "gateway=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}'); rm -f /etc/resolv.conf && { printf '%s\\n' '# Generated by statix-agent for job container DNS'; if [ -n \"$gateway\" ]; then printf '%s\\n' \"nameserver $gateway\"; fi; printf '%s\\n' 'nameserver 192.0.2.53' 'nameserver 2001:db8::53' 'options timeout:2 attempts:2'; } > /etc/resolv.conf"
+        );
+    }
+
+    #[test]
+    fn builds_explicit_guest_resolv_conf_command_without_default_gateway() {
+        let command = guest_resolv_conf_command(&ContainerDnsConfig {
+            nameservers: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+            include_default_gateway: false,
+        });
+
+        assert_eq!(
+            command,
+            "rm -f /etc/resolv.conf && printf '%s\\n' '# Generated by statix-agent for job container DNS' 'nameserver 1.1.1.1' 'nameserver 8.8.8.8' 'options timeout:2 attempts:2' > /etc/resolv.conf"
         );
     }
 }
