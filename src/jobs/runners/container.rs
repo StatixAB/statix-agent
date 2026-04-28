@@ -162,10 +162,11 @@ impl LxcContainer {
             .with_context(|| missing_dependency_message("lxc-start", "lxc"))?;
 
         if !status.success() {
+            let excerpt = lxc_log_excerpt(&log_path);
             bail!(
                 "lxc-start failed for container {} with {status}: {}",
                 self.name,
-                lxc_log_excerpt(&log_path)
+                lxc_start_failure_message(&excerpt)
             );
         }
 
@@ -555,6 +556,20 @@ fn lxc_log_excerpt(path: &Path) -> String {
     }
 }
 
+fn lxc_start_failure_message(log_excerpt: &str) -> String {
+    if log_excerpt.contains("Failed to mount \"proc\"")
+        && log_excerpt.contains("/usr/lib/")
+        && log_excerpt.contains("/lxc/rootfs/proc")
+        && log_excerpt.contains("Operation not permitted")
+    {
+        format!(
+            "{log_excerpt}\nHint: LXC needs write access to its package rootfs mountpoint under /usr/lib/*/lxc/rootfs. If statix-agent is running under systemd with ProtectSystem=strict, add ReadWritePaths for the distro multiarch LXC rootfs path and restart the service."
+        )
+    } else {
+        log_excerpt.to_string()
+    }
+}
+
 fn tail_for_log(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
@@ -640,5 +655,15 @@ mod tests {
     fn truncates_lxc_logs_from_the_tail() {
         assert_eq!(tail_for_log("abcdef", 3), "...def");
         assert_eq!(tail_for_log("abc", 3), "abc");
+    }
+
+    #[test]
+    fn adds_hint_for_lxc_proc_mount_denial_under_package_rootfs() {
+        let log = "Operation not permitted - Failed to mount \"proc\" onto \"/usr/lib/x86_64-linux-gnu/lxc/rootfs/proc\"";
+        let message = lxc_start_failure_message(log);
+
+        assert!(message.contains(log));
+        assert!(message.contains("ReadWritePaths"));
+        assert!(message.contains("/usr/lib/*/lxc/rootfs"));
     }
 }

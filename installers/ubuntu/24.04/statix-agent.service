@@ -29,6 +29,10 @@ PrivateTmp=true
 PrivateDevices=false
 ProtectHome=read-only
 ProtectSystem=strict
+# Ubuntu's LXC package uses this multiarch package directory as a temporary
+# rootfs mountpoint while starting containers. Keep it writable even though the
+# rest of /usr is read-only in the service mount namespace.
+ReadWritePaths=-/usr/lib/x86_64-linux-gnu/lxc/rootfs -/usr/lib/aarch64-linux-gnu/lxc/rootfs
 ProtectControlGroups=false
 ProtectKernelTunables=true
 ProtectKernelModules=true
