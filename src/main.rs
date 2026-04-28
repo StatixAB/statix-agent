@@ -384,11 +384,13 @@ async fn run_session(
         if !active_job {
             if let Some(job) = queued_jobs.pop_front() {
                 active_job = true;
+                eprintln!("[statix-agent] job {}: accepted", job.id);
                 let accepted = outbound_tx.send(OutboundMessage::JobStatus {
                     job_id: job.id.clone(),
                     status: "accepted",
                     message: None,
                 });
+                eprintln!("[statix-agent] job {}: started", job.id);
                 let started = outbound_tx.send(OutboundMessage::JobStatus {
                     job_id: job.id.clone(),
                     status: "started",
@@ -413,6 +415,11 @@ async fn run_session(
                             message: Some(format_error_chain(&error)),
                         },
                     };
+                    eprintln!(
+                        "[statix-agent] job {}: completed locally with status {}",
+                        completed.job_id,
+                        completed.status
+                    );
                     let _ = job_done_tx.send(completed);
                 });
             }
@@ -481,6 +488,8 @@ async fn run_session(
                     return Err(anyhow!("job completion channel closed"));
                 };
                 active_job = false;
+                let job_id = completed.job_id.clone();
+                let status = completed.status;
                 if completed.status == "failed" {
                     if let Some(message) = completed.message.as_deref() {
                         log_verbose(&format!("job {} failed: {message}", completed.job_id));
@@ -495,6 +504,9 @@ async fn run_session(
                 }).is_err() {
                     return Err(anyhow!("websocket writer is unavailable"));
                 }
+                eprintln!(
+                    "[statix-agent] job {job_id}: {status} status update queued for websocket delivery"
+                );
             }
             changed = stop_rx.changed() => {
                 if changed.is_ok() && *stop_rx.borrow() {
@@ -651,6 +663,11 @@ async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<jobs::JobEx
                     }
                 }
             };
+            eprintln!(
+                "[statix-agent] job {}: executing cargo_test in {} environment",
+                job.id,
+                runner_environment_label(&environment)
+            );
 
             jobs::execute(
                 &environment,
@@ -664,6 +681,13 @@ async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<jobs::JobEx
             )
             .await
         }
+    }
+}
+
+fn runner_environment_label(environment: &RunnerEnvironment) -> &'static str {
+    match environment {
+        RunnerEnvironment::Host => "host",
+        RunnerEnvironment::Microvm { .. } => "microvm",
     }
 }
 

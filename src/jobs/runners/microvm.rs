@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -106,21 +107,47 @@ impl Runner for MicrovmRunner {
 
         let runtime_root = agent_state_dir()?.join("microvm").join(&ctx.job_id).join(&ctx.attempt_id);
         fs::create_dir_all(&runtime_root).with_context(|| format!("failed to create {}", runtime_root.display()))?;
+        eprintln!(
+            "[statix-agent] job {}: preparing microvm runtime at {}",
+            ctx.job_id,
+            runtime_root.display()
+        );
 
         let base_image = resolve_base_image(&self.image, &runtime_root).await?;
+        eprintln!(
+            "[statix-agent] job {}: using microvm base image {}",
+            ctx.job_id,
+            base_image.display()
+        );
         let overlay_image = runtime_root.join("disk.qcow2");
         create_overlay_disk(&base_image, &overlay_image).await?;
+        eprintln!(
+            "[statix-agent] job {}: created microvm overlay disk {}",
+            ctx.job_id,
+            overlay_image.display()
+        );
 
         let ssh_dir = runtime_root.join("ssh");
         fs::create_dir_all(&ssh_dir).with_context(|| format!("failed to create {}", ssh_dir.display()))?;
         let private_key = ssh_dir.join("id_ed25519");
         let public_key = ssh_dir.join("id_ed25519.pub");
         generate_ssh_keypair(&private_key, &public_key).await?;
+        eprintln!("[statix-agent] job {}: generated microvm ssh keypair", ctx.job_id);
 
         let seed_iso = runtime_root.join("seed.iso");
         let workspace_tar = runtime_root.join("workspace.tar.gz");
         create_workspace_archive(&workspace_tar, &workspace.workdir).await?;
+        eprintln!(
+            "[statix-agent] job {}: archived workspace {}",
+            ctx.job_id,
+            workspace.workdir.display()
+        );
         create_cloud_init_seed(&seed_iso, &public_key).await?;
+        eprintln!(
+            "[statix-agent] job {}: created microvm cloud-init seed {}",
+            ctx.job_id,
+            seed_iso.display()
+        );
 
         let mut qemu = launch_qemu(
             &overlay_image,
@@ -130,20 +157,44 @@ impl Runner for MicrovmRunner {
             DEFAULT_SSH_PORT,
         )
         .await?;
+        eprintln!(
+            "[statix-agent] job {}: launched microvm with {} cpu(s), {} MiB memory, ssh port {}",
+            ctx.job_id,
+            self.cpu.unwrap_or(DEFAULT_CPU_COUNT),
+            self.memory_mb.unwrap_or(DEFAULT_MEMORY_MB),
+            DEFAULT_SSH_PORT
+        );
 
-        let result = match wait_for_guest_ready(&mut qemu, DEFAULT_SSH_PORT, ctx.timeout_seconds).await {
-            Ok(()) => run_guest_command(
-                DEFAULT_SSH_PORT,
-                &private_key,
-                ctx.timeout_seconds,
-                command,
-                workspace,
-                &workspace_tar,
-            )
-            .await,
-            Err(error) => Err(error),
+        let result = match wait_for_guest_ready(
+            &mut qemu,
+            DEFAULT_SSH_PORT,
+            &private_key,
+            ctx.timeout_seconds,
+        )
+        .await
+        {
+            Ok(()) => {
+                eprintln!("[statix-agent] job {}: microvm guest is ready", ctx.job_id);
+                run_guest_command(
+                    DEFAULT_SSH_PORT,
+                    &private_key,
+                    ctx.timeout_seconds,
+                    command,
+                    workspace,
+                    &workspace_tar,
+                )
+                .await
+            }
+            Err(error) => {
+                eprintln!(
+                    "[statix-agent] job {}: microvm readiness failed: {error:#}",
+                    ctx.job_id
+                );
+                Err(error)
+            }
         };
 
+        eprintln!("[statix-agent] job {}: shutting down microvm", ctx.job_id);
         qemu.shutdown().await;
 
         result
@@ -426,9 +477,15 @@ fn verbose_logs_enabled() -> bool {
     )
 }
 
-async fn wait_for_guest_ready(qemu: &mut QemuProcess, ssh_port: u16, timeout_seconds: u64) -> Result<()> {
+async fn wait_for_guest_ready(
+    qemu: &mut QemuProcess,
+    ssh_port: u16,
+    private_key: &Path,
+    timeout_seconds: u64,
+) -> Result<()> {
     let deadline = Duration::from_secs(timeout_seconds);
-    let start = std::time::Instant::now();
+    let start = Instant::now();
+    let mut next_progress_log = Duration::from_secs(15);
 
     loop {
         if let Some(status) = qemu.try_wait()? {
@@ -442,6 +499,8 @@ async fn wait_for_guest_ready(qemu: &mut QemuProcess, ssh_port: u16, timeout_sec
         let remaining = deadline.saturating_sub(start.elapsed());
         let mut probe = TokioCommand::new("ssh");
         probe
+            .arg("-i")
+            .arg(private_key)
             .arg("-o")
             .arg("BatchMode=yes")
             .arg("-o")
@@ -457,10 +516,36 @@ async fn wait_for_guest_ready(qemu: &mut QemuProcess, ssh_port: u16, timeout_sec
             .arg("-f")
             .arg("/var/lib/cloud/instance/boot-finished");
 
-        match timeout(remaining.min(Duration::from_secs(5)), probe.output()).await {
+        let last_probe_failure =
+            match timeout(remaining.min(Duration::from_secs(5)), probe.output()).await {
             Ok(Ok(output)) if output.status.success() => return Ok(()),
-            Ok(Ok(_)) | Ok(Err(_)) | Err(_) => sleep(Duration::from_secs(2)).await,
+            Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                if stderr.is_empty() {
+                    format!("ssh readiness probe exited with {}", output.status)
+                } else {
+                    format!(
+                        "ssh readiness probe exited with {}: {}",
+                        output.status,
+                        truncate_for_log(&stderr, 240)
+                    )
+                }
+            }
+            Ok(Err(error)) => format!("failed to launch ssh readiness probe: {error}"),
+            Err(_) => "ssh readiness probe timed out".to_string(),
+            };
+
+        let elapsed = start.elapsed();
+        if elapsed >= next_progress_log {
+            eprintln!(
+                "[statix-agent] waiting for microvm guest readiness for {}s; last probe: {}",
+                elapsed.as_secs(),
+                last_probe_failure
+            );
+            next_progress_log += Duration::from_secs(15);
         }
+
+        sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -472,6 +557,10 @@ async fn run_guest_command(
     workspace: &PreparedWorkspace,
     workspace_tar: &Path,
 ) -> Result<JobExecutionResult> {
+    eprintln!(
+        "[statix-agent] uploading workspace archive to microvm from {}",
+        workspace_tar.display()
+    );
     let upload = timeout(
         Duration::from_secs(timeout_seconds),
         async {
@@ -489,7 +578,10 @@ async fn run_guest_command(
                 .arg("-P")
                 .arg(ssh_port.to_string())
                 .arg(workspace_tar)
-                .arg(format!("{}@127.0.0.1:/home/{}/workspace.tar.gz", DEFAULT_SSH_USER, DEFAULT_SSH_USER));
+                .arg(format!(
+                    "{}@127.0.0.1:/home/{}/workspace.tar.gz",
+                    DEFAULT_SSH_USER, DEFAULT_SSH_USER
+                ));
             scp.output().await
         },
     )
@@ -499,11 +591,16 @@ async fn run_guest_command(
     .map_err(|error| error.context("failed to upload workspace archive to microvm"))?;
 
     if !upload.status.success() {
+        eprintln!(
+            "[statix-agent] microvm workspace archive upload failed with {}",
+            upload.status
+        );
         return Ok(JobExecutionResult {
             status: "failed",
             message: Some(summarize_command_output(&workspace.workdir, &upload.stdout, &upload.stderr)),
         });
     }
+    eprintln!("[statix-agent] uploaded workspace archive to microvm");
 
     let remote_command = format!(
         "mkdir -p /home/{user}/workspace && tar -xzf /home/{user}/workspace.tar.gz -C /home/{user}/workspace && cd /home/{user}/workspace && exec {command}",
@@ -511,6 +608,10 @@ async fn run_guest_command(
         command = shell_join(command)
     );
 
+    eprintln!(
+        "[statix-agent] running command inside microvm: {}",
+        shell_join(command)
+    );
     let output = timeout(
         Duration::from_secs(timeout_seconds),
         async {
@@ -542,10 +643,22 @@ async fn run_guest_command(
 
     let message = summarize_command_output(&workspace.workdir, &output.stdout, &output.stderr);
     if output.status.success() {
+        eprintln!("[statix-agent] microvm command succeeded");
         Ok(JobExecutionResult { status: "succeeded", message: Some(message) })
     } else {
+        eprintln!("[statix-agent] microvm command failed with {}", output.status);
         Ok(JobExecutionResult { status: "failed", message: Some(message) })
     }
+}
+
+fn truncate_for_log(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let mut shortened = value.chars().take(max_chars).collect::<String>();
+    shortened.push_str("...");
+    shortened
 }
 
 fn shell_join(command: &[String]) -> String {
