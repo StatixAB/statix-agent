@@ -708,11 +708,37 @@ fn runner_environment_label(environment: &RunnerEnvironment) -> &'static str {
 }
 
 fn cargo_test_command(args: &[String]) -> Vec<String> {
-    let mut command = Vec::with_capacity(args.len() + 2);
-    command.push("cargo".to_string());
-    command.push("test".to_string());
-    command.extend(args.iter().cloned());
+    let mut cargo_command = vec!["cargo".to_string(), "test".to_string()];
+    cargo_command.extend(args.iter().cloned());
+
+    vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        format!(
+            "if [ -f \"$HOME/.cargo/env\" ]; then . \"$HOME/.cargo/env\"; fi; exec {}",
+            shell_join(&cargo_command)
+        ),
+    ]
+}
+
+fn shell_join(command: &[String]) -> String {
     command
+        .iter()
+        .map(|value| shell_escape(value))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_escape(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    if value.chars().all(|character| character.is_ascii_alphanumeric() || "@%_-+=:,./".contains(character)) {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 async fn prepare_job_workdir(

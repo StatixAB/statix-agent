@@ -331,7 +331,10 @@ impl LxcContainer {
             "echo '[statix-agent] ip route:'; ip route || true; ",
             "echo '[statix-agent] /etc/resolv.conf:'; cat /etc/resolv.conf || true; ",
             "command -v cargo >/dev/null 2>&1 || ",
-            "(apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates cargo git libssl-dev pkg-config)"
+            "(apt-get update && ",
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl git libssl-dev pkg-config && ",
+            "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | ",
+            "sh -s -- -y --profile minimal --default-toolchain stable)"
         );
         let output = self.attach_output(timeout_seconds, setup_command).await?;
         if !output.status.success() {

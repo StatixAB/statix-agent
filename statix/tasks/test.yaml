@@ -6,9 +6,11 @@ task:
       type: container
       image: ubuntu:24.04
   command:
-    - cargo
-    - test
+    - bash
+    - -lc
+    - . "$HOME/.cargo/env" && cargo test
   setup:
+    - rust-toolchain
     - cargo-deps
   inputs:
     sources:

@@ -24,11 +24,19 @@ resources:
     profile: standard
 
 setups:
+  rust-toolchain:
+    description: Install a current stable Rust toolchain for edition 2024 builds.
+    run:
+      - bash
+      - -lc
+      - apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl build-essential git libssl-dev pkg-config && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+    cacheKey: rustup-stable-v1
   cargo-deps:
     description: Prepare the Rust dependency graph for test runs.
     run:
-      - cargo
-      - fetch
+      - bash
+      - -lc
+      - . "$HOME/.cargo/env" && cargo fetch
     cacheKey: cargo-lock-v1
 
 tasks:
@@ -39,9 +47,11 @@ tasks:
         type: container
         image: ubuntu:24.04
     command:
-      - cargo
-      - test
+      - bash
+      - -lc
+      - . "$HOME/.cargo/env" && cargo test
     setup:
+      - rust-toolchain
       - cargo-deps
     inputs:
       sources:
