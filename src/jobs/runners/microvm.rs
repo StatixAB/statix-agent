@@ -333,12 +333,13 @@ package_update: true
 packages:
   - build-essential
   - ca-certificates
-  - cargo
   - curl
   - git
   - libssl-dev
   - openssh-server
   - pkg-config
+runcmd:
+  - [su, "-", "{user}", "-c", "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable"]
 "#,
         user = DEFAULT_SSH_USER,
         public_key = public_key.trim(),
@@ -577,7 +578,7 @@ async fn run_guest_command(
     eprintln!("[statix-agent] uploaded workspace archive to microvm");
 
     let remote_command = format!(
-        "mkdir -p /home/{user}/workspace && tar -xzf /home/{user}/workspace.tar.gz -C /home/{user}/workspace && cd /home/{user}/workspace && exec {command}",
+        "if [ -f /home/{user}/.cargo/env ]; then . /home/{user}/.cargo/env; fi; mkdir -p /home/{user}/workspace && tar -xzf /home/{user}/workspace.tar.gz -C /home/{user}/workspace && cd /home/{user}/workspace && exec {command}",
         user = DEFAULT_SSH_USER,
         command = shell_join(command)
     );
@@ -613,7 +614,11 @@ async fn run_guest_command(
         eprintln!("[statix-agent] microvm command succeeded");
         Ok(JobExecutionResult { status: "succeeded", message: Some(message) })
     } else {
-        eprintln!("[statix-agent] microvm command failed with {}", output.status);
+        eprintln!(
+            "[statix-agent] microvm command failed with {}; output: {}",
+            output.status,
+            truncate_for_log(&message, 1_000)
+        );
         Ok(JobExecutionResult { status: "failed", message: Some(message) })
     }
 }

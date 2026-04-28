@@ -76,6 +76,14 @@ struct AgentJob {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum JobEnvironment {
     Host,
+    Container {
+        #[serde(default)]
+        image: Option<String>,
+        #[serde(default)]
+        cpu: Option<u8>,
+        #[serde(rename = "memoryMb", default)]
+        memory_mb: Option<u32>,
+    },
     Microvm {
         #[serde(default)]
         image: Option<String>,
@@ -655,6 +663,13 @@ async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<jobs::JobEx
             });
             let environment = match execution.environment.unwrap_or(JobEnvironment::Host) {
                 JobEnvironment::Host => RunnerEnvironment::Host,
+                JobEnvironment::Container { image, cpu, memory_mb } => {
+                    RunnerEnvironment::Container {
+                        image: image.unwrap_or_else(|| config.container_default_image.clone()),
+                        cpu: cpu.or(Some(config.container_default_cpu)),
+                        memory_mb: memory_mb.or(Some(config.container_default_memory_mb)),
+                    }
+                }
                 JobEnvironment::Microvm { image, cpu, memory_mb } => {
                     RunnerEnvironment::Microvm {
                         image: image.unwrap_or_else(|| config.microvm_default_image.clone()),
@@ -687,6 +702,7 @@ async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<jobs::JobEx
 fn runner_environment_label(environment: &RunnerEnvironment) -> &'static str {
     match environment {
         RunnerEnvironment::Host => "host",
+        RunnerEnvironment::Container { .. } => "container",
         RunnerEnvironment::Microvm { .. } => "microvm",
     }
 }

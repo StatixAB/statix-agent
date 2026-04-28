@@ -11,7 +11,7 @@ metadata:
     component: agent
 
 defaults:
-  runtime: microvm
+  runtime: container
   shell: bash
   timeoutSeconds: 1800
   retryLimit: 0
@@ -20,7 +20,7 @@ defaults:
 
 resources:
   default:
-    executor: microvm
+    executor: container
     profile: standard
 
 setups:
@@ -33,11 +33,11 @@ setups:
 
 tasks:
   test:
-    executor: microvm
+    executor: container
     execution:
       environment:
-        type: microvm
-        image: ubuntu-24.04
+        type: container
+        image: ubuntu:24.04
     command:
       - cargo
       - test

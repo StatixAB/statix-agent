@@ -7,6 +7,11 @@ use anyhow::Result;
 #[derive(Debug, Clone)]
 pub enum RunnerEnvironment {
     Host,
+    Container {
+        image: String,
+        cpu: Option<u8>,
+        memory_mb: Option<u32>,
+    },
     Microvm {
         image: String,
         cpu: Option<u8>,
@@ -40,6 +45,11 @@ pub async fn execute(
 ) -> Result<JobExecutionResult> {
     match environment {
         RunnerEnvironment::Host => runners::host::HostRunner.execute(ctx, workspace, command).await,
+        RunnerEnvironment::Container { image, cpu, memory_mb } => {
+            runners::container::ContainerRunner::new(image.clone(), *cpu, *memory_mb)
+                .execute(ctx, workspace, command)
+                .await
+        }
         RunnerEnvironment::Microvm { image, cpu, memory_mb } => {
             runners::microvm::MicrovmRunner::new(image.clone(), *cpu, *memory_mb)
                 .execute(ctx, workspace, command)
