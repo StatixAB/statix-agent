@@ -557,6 +557,15 @@ fn lxc_log_excerpt(path: &Path) -> String {
 }
 
 fn lxc_start_failure_message(log_excerpt: &str) -> String {
+    if log_excerpt.contains("lxc-user-nic failed to configure requested network")
+        && log_excerpt.contains("Read-only file system")
+        && log_excerpt.contains("/run/lxc/nics")
+    {
+        return format!(
+            "{log_excerpt}\nHint: lxc-user-nic needs write access to /run/lxc/nics to serialize unprivileged veth allocation. If statix-agent is running under systemd with ProtectSystem=strict, add ReadWritePaths=/run/lxc and restart the service."
+        );
+    }
+
     lxc_start_failure_message_with_host_context(log_excerpt, proc_mount_uses_noatime())
 }
 
@@ -715,5 +724,14 @@ mod tests {
 
         assert!(message.contains("noatime"));
         assert!(message.contains("relatime"));
+    }
+
+    #[test]
+    fn adds_hint_for_read_only_lxc_user_nic_lock_path() {
+        let log = "lxc-user-nic failed to configure requested network: open_and_lock - Read-only file system - Failed to open \"/run/lxc/nics\"";
+        let message = lxc_start_failure_message(log);
+
+        assert!(message.contains(log));
+        assert!(message.contains("ReadWritePaths=/run/lxc"));
     }
 }
