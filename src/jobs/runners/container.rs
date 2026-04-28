@@ -23,6 +23,7 @@ use crate::{
 const DEFAULT_CPU_COUNT: u8 = 2;
 const DEFAULT_MEMORY_MB: u32 = 4096;
 const WORKSPACE_ARCHIVE: &str = "statix-workspace.tar.gz";
+const GUEST_ARCHIVE_DIR: &str = "/var/lib/statix-agent";
 
 pub struct ContainerRunner {
     image: String,
@@ -216,7 +217,16 @@ impl LxcContainer {
     }
 
     async fn copy_archive_to_guest(&self, archive_path: &Path) -> Result<()> {
-        let destination = self.rootfs_path().join("tmp").join(WORKSPACE_ARCHIVE);
+        let archive_dir = self
+            .rootfs_path()
+            .join(GUEST_ARCHIVE_DIR.trim_start_matches('/'));
+        fs::create_dir_all(&archive_dir).with_context(|| {
+            format!(
+                "failed to create guest archive directory {}",
+                archive_dir.display()
+            )
+        })?;
+        let destination = archive_dir.join(WORKSPACE_ARCHIVE);
         fs::copy(archive_path, &destination).with_context(|| {
             format!(
                 "failed to copy workspace archive into lxc rootfs at {}",
@@ -316,7 +326,8 @@ impl LxcContainer {
         workspace: &PreparedWorkspace,
     ) -> Result<JobExecutionResult> {
         let guest_command = format!(
-            "rm -rf /workspace && mkdir -p /workspace && tar -xzf /tmp/{archive} -C /workspace && cd /workspace && exec {command}",
+            "rm -rf /workspace && mkdir -p /workspace && tar -xzf {archive_dir}/{archive} -C /workspace && cd /workspace && exec {command}",
+            archive_dir = GUEST_ARCHIVE_DIR,
             archive = WORKSPACE_ARCHIVE,
             command = shell_join(command)
         );
