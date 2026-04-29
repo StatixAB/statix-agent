@@ -304,15 +304,18 @@ impl LxcContainer {
         let output = self
             .attach_output(timeout_seconds, &guest_command, Some(ctx))
             .await?;
-        let message = summarize_command_output(&workspace.workdir, &output.stdout, &output.stderr);
-
         if output.status.success() {
             eprintln!("[statix-agent] lxc container command succeeded");
             Ok(JobExecutionResult {
                 status: "succeeded",
-                message: Some(message),
+                message: Some(format!(
+                    "{}: command completed successfully",
+                    workspace.workdir.display()
+                )),
             })
         } else {
+            let message =
+                summarize_command_output(&workspace.workdir, &output.stdout, &output.stderr);
             eprintln!(
                 "[statix-agent] lxc container command failed with {}; output: {}",
                 output.status,
