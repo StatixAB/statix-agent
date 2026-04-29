@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_API_BASE_URL: &str = "https://statix.se/api";
+const DEFAULT_API_BASE_URL: &str = "https://statix.se";
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -449,8 +449,8 @@ fn normalize_api_base_url(value: &str) -> String {
         .map(|index| &without_scheme[index..])
         .unwrap_or("");
 
-    if (hostname == "statix.se" || hostname.ends_with(".statix.se")) && path.is_empty() {
-        return format!("{trimmed}/api");
+    if (hostname == "statix.se" || hostname.ends_with(".statix.se")) && path == "/api" {
+        return trimmed.trim_end_matches("/api").to_owned();
     }
 
     trimmed
@@ -601,16 +601,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_login_config_appends_api_for_hosted_root_url() {
+    fn resolve_login_config_keeps_hosted_root_url() {
         let api_base_url =
             resolve_login_api_base_url(Some("https://statix.se".to_owned()), None, None);
-        assert_eq!(api_base_url, "https://statix.se/api");
+        assert_eq!(api_base_url, "https://statix.se");
     }
 
     #[test]
-    fn normalize_api_base_url_appends_api_for_hosted_subdomain_root_url() {
+    fn normalize_api_base_url_keeps_hosted_subdomain_root_url() {
         let api_base_url = normalize_api_base_url("https://dev.statix.se/");
-        assert_eq!(api_base_url, "https://dev.statix.se/api");
+        assert_eq!(api_base_url, "https://dev.statix.se");
+    }
+
+    #[test]
+    fn normalize_api_base_url_strips_legacy_api_path_for_hosted_urls() {
+        let api_base_url = normalize_api_base_url("https://dev.statix.se/api/");
+        assert_eq!(api_base_url, "https://dev.statix.se");
     }
 
     #[test]
