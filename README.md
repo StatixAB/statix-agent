@@ -5,6 +5,7 @@ Host-side Statix agent repository.
 This repo contains:
 - the Rust `statix` agent binary
 - Ubuntu installer assets under `installers/ubuntu/24.04`
+- Arch Linux installer assets under `installers/archlinux`
 - the host-side systemd units and updater script
 
 ## Releases
@@ -16,8 +17,10 @@ The expected public release assets are:
 - distro-specific installer assets for supported distributions, for example:
 - `statix-agent-install-ubuntu-24.04.sh`
 - `statix-agent-update-ubuntu-24.04.sh`
+- `statix-agent-install-archlinux.sh`
+- `statix-agent-update-archlinux.sh`
 
-The Ubuntu 24.04 installer assets should be published under:
+Installer assets should be published under:
 
 ```bash
 https://github.com/statixab/statix-agent/releases/latest/download

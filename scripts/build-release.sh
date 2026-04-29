@@ -6,7 +6,8 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-dist}"
 RELEASE_ROOT="${OUTPUT_ROOT}/release"
 UPLOAD_ROOT="${OUTPUT_ROOT}/upload"
 LINUX_ROOT="${RELEASE_ROOT}/linux"
-INSTALLER_ROOT="${RELEASE_ROOT}/installers/ubuntu/24.04"
+UBUNTU_INSTALLER_ROOT="${RELEASE_ROOT}/installers/ubuntu/24.04"
+ARCH_INSTALLER_ROOT="${RELEASE_ROOT}/installers/archlinux"
 METADATA_ROOT="${RELEASE_ROOT}/metadata"
 BINARY_NAME="statix"
 
@@ -75,7 +76,7 @@ binary_path_for_target() {
 }
 
 prepare_dirs() {
-  mkdir -p "$LINUX_ROOT" "$INSTALLER_ROOT" "$METADATA_ROOT" "$UPLOAD_ROOT"
+  mkdir -p "$LINUX_ROOT" "$UBUNTU_INSTALLER_ROOT" "$ARCH_INSTALLER_ROOT" "$METADATA_ROOT" "$UPLOAD_ROOT"
 }
 
 build_binary_assets() {
@@ -110,10 +111,15 @@ build_binary_assets() {
 build_shared_assets() {
   local built_at git_tag git_sha
 
-  install -m 0755 installers/ubuntu/24.04/install.sh "${INSTALLER_ROOT}/statix-agent-install-ubuntu-24.04.sh"
-  install -m 0755 installers/ubuntu/24.04/update.sh "${INSTALLER_ROOT}/statix-agent-update-ubuntu-24.04.sh"
-  install -m 0644 installers/ubuntu/24.04/statix-agent.service "${INSTALLER_ROOT}/statix-agent.service"
-  install -m 0644 installers/ubuntu/24.04/statix-agent-update.service "${INSTALLER_ROOT}/statix-agent-update.service"
+  install -m 0755 installers/ubuntu/24.04/install.sh "${UBUNTU_INSTALLER_ROOT}/statix-agent-install-ubuntu-24.04.sh"
+  install -m 0755 installers/ubuntu/24.04/update.sh "${UBUNTU_INSTALLER_ROOT}/statix-agent-update-ubuntu-24.04.sh"
+  install -m 0644 installers/ubuntu/24.04/statix-agent.service "${UBUNTU_INSTALLER_ROOT}/statix-agent.service"
+  install -m 0644 installers/ubuntu/24.04/statix-agent-update.service "${UBUNTU_INSTALLER_ROOT}/statix-agent-update.service"
+
+  install -m 0755 installers/archlinux/install.sh "${ARCH_INSTALLER_ROOT}/statix-agent-install-archlinux.sh"
+  install -m 0755 installers/archlinux/update.sh "${ARCH_INSTALLER_ROOT}/statix-agent-update-archlinux.sh"
+  install -m 0644 installers/archlinux/statix-agent.service "${ARCH_INSTALLER_ROOT}/statix-agent.service"
+  install -m 0644 installers/archlinux/statix-agent-update.service "${ARCH_INSTALLER_ROOT}/statix-agent-update.service"
 
   built_at="${BUILT_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
   git_tag="${GIT_TAG:-$(git describe --tags --exact-match 2>/dev/null || printf 'dev')}"
@@ -127,10 +133,13 @@ build_shared_assets() {
 }
 EOF
 
-  install -m 0755 "${INSTALLER_ROOT}/statix-agent-install-ubuntu-24.04.sh" "${UPLOAD_ROOT}/statix-agent-install-ubuntu-24.04.sh"
-  install -m 0755 "${INSTALLER_ROOT}/statix-agent-update-ubuntu-24.04.sh" "${UPLOAD_ROOT}/statix-agent-update-ubuntu-24.04.sh"
-  install -m 0644 "${INSTALLER_ROOT}/statix-agent.service" "${UPLOAD_ROOT}/statix-agent.service"
-  install -m 0644 "${INSTALLER_ROOT}/statix-agent-update.service" "${UPLOAD_ROOT}/statix-agent-update.service"
+  install -m 0755 "${UBUNTU_INSTALLER_ROOT}/statix-agent-install-ubuntu-24.04.sh" "${UPLOAD_ROOT}/statix-agent-install-ubuntu-24.04.sh"
+  install -m 0755 "${UBUNTU_INSTALLER_ROOT}/statix-agent-update-ubuntu-24.04.sh" "${UPLOAD_ROOT}/statix-agent-update-ubuntu-24.04.sh"
+  install -m 0644 "${UBUNTU_INSTALLER_ROOT}/statix-agent.service" "${UPLOAD_ROOT}/statix-agent.service"
+  install -m 0644 "${UBUNTU_INSTALLER_ROOT}/statix-agent-update.service" "${UPLOAD_ROOT}/statix-agent-update.service"
+
+  install -m 0755 "${ARCH_INSTALLER_ROOT}/statix-agent-install-archlinux.sh" "${UPLOAD_ROOT}/statix-agent-install-archlinux.sh"
+  install -m 0755 "${ARCH_INSTALLER_ROOT}/statix-agent-update-archlinux.sh" "${UPLOAD_ROOT}/statix-agent-update-archlinux.sh"
   install -m 0644 "${METADATA_ROOT}/version.json" "${UPLOAD_ROOT}/version.json"
 }
 
