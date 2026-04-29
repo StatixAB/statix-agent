@@ -3,6 +3,7 @@ pub mod runners;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub enum RunnerEnvironment {
@@ -24,6 +25,45 @@ pub struct ExecutionContext {
     pub job_id: String,
     pub attempt_id: String,
     pub timeout_seconds: u64,
+    pub log_tx: Option<mpsc::UnboundedSender<JobLogLine>>,
+}
+
+impl ExecutionContext {
+    pub(crate) fn emit_log(&self, stream: JobLogStream, line: impl Into<String>) {
+        let Some(log_tx) = &self.log_tx else {
+            return;
+        };
+
+        let _ = log_tx.send(JobLogLine {
+            job_id: self.job_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            stream,
+            line: line.into(),
+        });
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JobLogLine {
+    pub job_id: String,
+    pub attempt_id: String,
+    pub stream: JobLogStream,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum JobLogStream {
+    Stdout,
+    Stderr,
+}
+
+impl JobLogStream {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobLogStream::Stdout => "stdout",
+            JobLogStream::Stderr => "stderr",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

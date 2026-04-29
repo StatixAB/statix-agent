@@ -12,7 +12,9 @@ use tokio::{
     time::{Duration, timeout},
 };
 
-use crate::jobs::{JobExecutionResult, PreparedWorkspace, summarize_command_output};
+use crate::jobs::{
+    ExecutionContext, JobExecutionResult, JobLogStream, PreparedWorkspace, summarize_command_output,
+};
 
 use super::{
     archive::WORKSPACE_ARCHIVE,
@@ -196,7 +198,7 @@ impl LxcContainer {
         }
 
         let command = guest_resolv_conf_command(&dns_config);
-        let output = self.attach_output(timeout_seconds, &command).await?;
+        let output = self.attach_output(timeout_seconds, &command, None).await?;
         if !output.status.success() {
             bail!(
                 "failed to configure lxc container DNS with {}: {}",
@@ -223,7 +225,7 @@ impl LxcContainer {
         let guest_address = guest_ipv4_address(&network, &self.name);
         let command = guest_network_command(&network, guest_address);
 
-        let output = self.attach_output(timeout_seconds, &command).await?;
+        let output = self.attach_output(timeout_seconds, &command, None).await?;
         if !output.status.success() {
             bail!(
                 "failed to configure lxc container network with {}: {}",
@@ -240,6 +242,7 @@ impl LxcContainer {
 
     pub(super) async fn prepare_guest(
         &self,
+        ctx: &ExecutionContext,
         timeout_seconds: u64,
         workspace: &PreparedWorkspace,
     ) -> Result<Option<JobExecutionResult>> {
@@ -254,7 +257,9 @@ impl LxcContainer {
             "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | ",
             "sh -s -- -y --profile minimal --default-toolchain stable)"
         );
-        let output = self.attach_output(timeout_seconds, setup_command).await?;
+        let output = self
+            .attach_output(timeout_seconds, setup_command, Some(ctx))
+            .await?;
         if !output.status.success() {
             let message =
                 summarize_command_output(&workspace.workdir, &output.stdout, &output.stderr);
@@ -273,6 +278,7 @@ impl LxcContainer {
 
     pub(super) async fn run_command(
         &self,
+        ctx: &ExecutionContext,
         timeout_seconds: u64,
         command: &[String],
         workspace: &PreparedWorkspace,
@@ -288,7 +294,9 @@ impl LxcContainer {
             self.name,
             shell_join(command)
         );
-        let output = self.attach_output(timeout_seconds, &guest_command).await?;
+        let output = self
+            .attach_output(timeout_seconds, &guest_command, Some(ctx))
+            .await?;
         let message = summarize_command_output(&workspace.workdir, &output.stdout, &output.stderr);
 
         if output.status.success() {
@@ -310,7 +318,12 @@ impl LxcContainer {
         }
     }
 
-    async fn attach_output(&self, timeout_seconds: u64, shell_command: &str) -> Result<Output> {
+    async fn attach_output(
+        &self,
+        timeout_seconds: u64,
+        shell_command: &str,
+        ctx: Option<&ExecutionContext>,
+    ) -> Result<Output> {
         let mut process = lxc_command("lxc-attach");
         process
             .arg("-n")
@@ -342,13 +355,27 @@ impl LxcContainer {
             .context("failed to capture lxc-attach stderr")?;
 
         let container_name_for_stdout = self.name.clone();
+        let stdout_ctx = ctx.cloned();
         let stdout_task = tokio::spawn(async move {
-            stream_and_collect_output(stdout, &container_name_for_stdout, false).await
+            stream_and_collect_output(
+                stdout,
+                &container_name_for_stdout,
+                JobLogStream::Stdout,
+                stdout_ctx,
+            )
+            .await
         });
 
         let container_name_for_stderr = self.name.clone();
+        let stderr_ctx = ctx.cloned();
         let stderr_task = tokio::spawn(async move {
-            stream_and_collect_output(stderr, &container_name_for_stderr, true).await
+            stream_and_collect_output(
+                stderr,
+                &container_name_for_stderr,
+                JobLogStream::Stderr,
+                stderr_ctx,
+            )
+            .await
         });
 
         let status = match timeout(Duration::from_secs(timeout_seconds), child.wait()).await {
@@ -424,7 +451,8 @@ impl LxcContainer {
 async fn stream_and_collect_output(
     stream: impl tokio::io::AsyncRead + Unpin,
     container_name: &str,
-    is_stderr: bool,
+    stream_name: JobLogStream,
+    ctx: Option<ExecutionContext>,
 ) -> Result<Vec<u8>> {
     let mut reader = BufReader::new(stream);
     let mut buffer = Vec::new();
@@ -443,11 +471,17 @@ async fn stream_and_collect_output(
 
         buffer.extend_from_slice(&line);
         let message = String::from_utf8_lossy(&line);
-        let channel = if is_stderr { "stderr" } else { "stdout" };
+        let channel = stream_name.as_str();
         eprint!(
             "[statix-agent] lxc container {} {} | {}",
             container_name, channel, message
         );
+        if let Some(ctx) = &ctx {
+            ctx.emit_log(
+                stream_name,
+                message.trim_end_matches(['\r', '\n']).to_owned(),
+            );
+        }
     }
 
     Ok(buffer)

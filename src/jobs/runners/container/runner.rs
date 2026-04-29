@@ -89,12 +89,15 @@ impl Runner for ContainerRunner {
             container.start().await?;
             container.configure_guest_network(ctx.timeout_seconds).await?;
             container.configure_guest_dns(ctx.timeout_seconds).await?;
-            if let Some(result) = container.prepare_guest(ctx.timeout_seconds, workspace).await? {
+            if let Some(result) = container
+                .prepare_guest(ctx, ctx.timeout_seconds, workspace)
+                .await?
+            {
                 return Ok(result);
             }
             container.copy_archive_to_guest(&workspace_tar).await?;
             container
-                .run_command(ctx.timeout_seconds, command, workspace)
+                .run_command(ctx, ctx.timeout_seconds, command, workspace)
                 .await
         }
         .await;

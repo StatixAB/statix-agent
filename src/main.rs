@@ -51,6 +51,15 @@ enum ClientMessage<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<&'a str>,
     },
+    #[serde(rename = "job_log")]
+    JobLog {
+        #[serde(rename = "jobId")]
+        job_id: &'a str,
+        #[serde(rename = "attemptId")]
+        attempt_id: &'a str,
+        stream: &'a str,
+        line: &'a str,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +172,7 @@ enum OutboundMessage {
         status: &'static str,
         message: Option<String>,
     },
+    JobLog(jobs::JobLogLine),
     Metrics(metrics::MetricsPayload),
     SystemInfo(system_info::SystemInfoPayload),
 }
@@ -353,6 +363,7 @@ async fn run_session(
     let (mut ws_write, mut ws_read) = ws.split();
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
     let (job_done_tx, mut job_done_rx) = mpsc::unbounded_channel::<CompletedJobStatus>();
+    let (job_log_tx, mut job_log_rx) = mpsc::unbounded_channel::<jobs::JobLogLine>();
     tokio::spawn(async move {
         while let Some(message) = outbound_rx.recv().await {
             let send_result = match message {
@@ -367,6 +378,18 @@ async fn run_session(
                             job_id: &job_id,
                             status,
                             message: message.as_deref(),
+                        },
+                    )
+                    .await
+                }
+                OutboundMessage::JobLog(log) => {
+                    send_client_message(
+                        &mut ws_write,
+                        &ClientMessage::JobLog {
+                            job_id: &log.job_id,
+                            attempt_id: &log.attempt_id,
+                            stream: log.stream.as_str(),
+                            line: &log.line,
                         },
                     )
                     .await
@@ -410,8 +433,9 @@ async fn run_session(
 
                 let config = config.clone();
                 let job_done_tx = job_done_tx.clone();
+                let job_log_tx = job_log_tx.clone();
                 tokio::spawn(async move {
-                    let completed = match execute_job(&config, &job).await {
+                    let completed = match execute_job(&config, &job, job_log_tx).await {
                         Ok(result) => CompletedJobStatus {
                             job_id: job.id.clone(),
                             status: result.status,
@@ -515,6 +539,12 @@ async fn run_session(
                 eprintln!(
                     "[statix-agent] job {job_id}: {status} status update queued for websocket delivery"
                 );
+            }
+            log = job_log_rx.recv() => {
+                let Some(log) = log else {
+                    return Err(anyhow!("job log channel closed"));
+                };
+                let _ = outbound_tx.send(OutboundMessage::JobLog(log));
             }
             changed = stop_rx.changed() => {
                 if changed.is_ok() && *stop_rx.borrow() {
@@ -629,7 +659,11 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
-async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<jobs::JobExecutionResult> {
+async fn execute_job(
+    config: &AgentConfig,
+    job: &AgentJob,
+    log_tx: mpsc::UnboundedSender<jobs::JobLogLine>,
+) -> Result<jobs::JobExecutionResult> {
     match &job.spec {
         AgentJobSpec::UpdateAgent {
             target_version,
@@ -690,6 +724,7 @@ async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<jobs::JobEx
                     job_id: execution.job_id.unwrap_or_else(|| job.id.clone()),
                     attempt_id: execution.attempt_id.unwrap_or_else(|| job.id.clone()),
                     timeout_seconds: timeout_seconds.unwrap_or(1800),
+                    log_tx: Some(log_tx),
                 },
                 &workspace,
                 &cargo_test_command(args),

@@ -57,7 +57,7 @@ fn lxc_start_failure_message_with_host_context(
             Some(false) => message.push_str(
                 " If ReadWritePaths is already applied, check whether systemd ProtectKernelTunables is enabled for statix-agent; it can make proc/sys paths read-only in the service mount namespace and block LXC's procfs mount. Also check the host /proc mount options with `findmnt -no OPTIONS /proc`; unprivileged LXC can fail when /proc is mounted with noatime instead of relatime.",
             ),
-            None => message.push_str(
+            none => message.push_str(
                 " If ReadWritePaths is already applied, check whether systemd ProtectKernelTunables is enabled for statix-agent; it can make proc/sys paths read-only in the service mount namespace and block LXC's procfs mount. Also check the host /proc mount options; unprivileged LXC can fail when /proc is mounted with noatime instead of relatime.",
             ),
         }
