@@ -20,8 +20,8 @@ use enrollment::{LoginOptions, run_login};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    select, signal,
     process::Command as TokioCommand,
+    select, signal,
     sync::{mpsc, watch},
     time::{MissedTickBehavior, interval},
 };
@@ -38,11 +38,20 @@ use crate::{
 #[serde(tag = "type")]
 enum ClientMessage<'a> {
     #[serde(rename = "auth")]
-    Auth { #[serde(rename = "nodeId")] node_id: &'a str, #[serde(rename = "nodeToken")] node_token: &'a str },
+    Auth {
+        #[serde(rename = "nodeId")]
+        node_id: &'a str,
+        #[serde(rename = "nodeToken")]
+        node_token: &'a str,
+    },
     #[serde(rename = "metrics")]
-    Metrics { payload: &'a metrics::MetricsPayload },
+    Metrics {
+        payload: &'a metrics::MetricsPayload,
+    },
     #[serde(rename = "system_info")]
-    SystemInfo { payload: &'a system_info::SystemInfoPayload },
+    SystemInfo {
+        payload: &'a system_info::SystemInfoPayload,
+    },
     #[serde(rename = "job_status")]
     JobStatus {
         #[serde(rename = "jobId")]
@@ -51,13 +60,25 @@ enum ClientMessage<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<&'a str>,
     },
+    #[serde(rename = "job_log")]
+    JobLog {
+        #[serde(rename = "jobId")]
+        job_id: &'a str,
+        #[serde(rename = "attemptId")]
+        attempt_id: &'a str,
+        stream: &'a str,
+        line: &'a str,
+    },
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum ServerMessage {
     #[serde(rename = "ready")]
-    Ready { #[serde(rename = "nodeId")] node_id: String },
+    Ready {
+        #[serde(rename = "nodeId")]
+        node_id: String,
+    },
     #[serde(rename = "error")]
     Error { error: String },
     #[serde(rename = "job")]
@@ -114,7 +135,7 @@ enum AgentJobSpec {
         target_version: Option<String>,
         channel: Option<String>,
         #[serde(default)]
-        execution: Option<JobExecutionConfig>,
+        _execution: Option<JobExecutionConfig>,
     },
     #[serde(rename = "run_test")]
     RunTest {
@@ -146,7 +167,7 @@ enum JobSource {
     #[serde(rename = "workspace_archive")]
     WorkspaceArchive {
         #[serde(rename = "archiveId", default)]
-        archive_id: Option<String>,
+        _archive_id: Option<String>,
         #[serde(default)]
         subdir: Option<String>,
     },
@@ -163,6 +184,7 @@ enum OutboundMessage {
         status: &'static str,
         message: Option<String>,
     },
+    JobLog(jobs::JobLogLine),
     Metrics(metrics::MetricsPayload),
     SystemInfo(system_info::SystemInfoPayload),
 }
@@ -243,13 +265,13 @@ async fn run_agent() -> Result<()> {
         "Agent identity not configured. Run `statix login --api-base-url http://host:3001` or set NODE_ID/NODE_TOKEN in the environment.",
     )?;
     eprintln!("[statix-agent] starting with nodeId: {}", config.node_id);
-        log_verbose(&format!(
-            "runtime config: ws={}, api={}, publish={}ms, system-check={}ms",
-            config.agent_ws_url,
-            config.api_base_url,
-            config.publish_interval_ms,
-            config.system_info_check_interval_ms
-        ));
+    log_verbose(&format!(
+        "runtime config: ws={}, api={}, publish={}ms, system-check={}ms",
+        config.agent_ws_url,
+        config.api_base_url,
+        config.publish_interval_ms,
+        config.system_info_check_interval_ms
+    ));
 
     if let Some(wireguard) = config
         .wireguard
@@ -310,7 +332,12 @@ async fn run_session(
         connect_async(config.agent_ws_url.as_str()),
     )
     .await
-    .map_err(|_| anyhow!("ws connect timed out after {} ms", config.connect_timeout_ms))?
+    .map_err(|_| {
+        anyhow!(
+            "ws connect timed out after {} ms",
+            config.connect_timeout_ms
+        )
+    })?
     .context("failed to connect websocket")?;
     let (mut ws, _) = connect;
 
@@ -340,7 +367,9 @@ async fn run_session(
         config.wireguard.as_ref(),
         &mut last_system_info_hash,
         &mut last_system_info_published_at,
-    ).await {
+    )
+    .await
+    {
         eprintln!("[statix-agent] system info publish failed: {error:#}");
     }
 
@@ -353,6 +382,7 @@ async fn run_session(
     let (mut ws_write, mut ws_read) = ws.split();
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<OutboundMessage>();
     let (job_done_tx, mut job_done_rx) = mpsc::unbounded_channel::<CompletedJobStatus>();
+    let (job_log_tx, mut job_log_rx) = mpsc::unbounded_channel::<jobs::JobLogLine>();
     tokio::spawn(async move {
         while let Some(message) = outbound_rx.recv().await {
             let send_result = match message {
@@ -371,11 +401,31 @@ async fn run_session(
                     )
                     .await
                 }
+                OutboundMessage::JobLog(log) => {
+                    send_client_message(
+                        &mut ws_write,
+                        &ClientMessage::JobLog {
+                            job_id: &log.job_id,
+                            attempt_id: &log.attempt_id,
+                            stream: log.stream.as_str(),
+                            line: &log.line,
+                        },
+                    )
+                    .await
+                }
                 OutboundMessage::Metrics(payload) => {
-                    send_client_message(&mut ws_write, &ClientMessage::Metrics { payload: &payload }).await
+                    send_client_message(
+                        &mut ws_write,
+                        &ClientMessage::Metrics { payload: &payload },
+                    )
+                    .await
                 }
                 OutboundMessage::SystemInfo(payload) => {
-                    send_client_message(&mut ws_write, &ClientMessage::SystemInfo { payload: &payload }).await
+                    send_client_message(
+                        &mut ws_write,
+                        &ClientMessage::SystemInfo { payload: &payload },
+                    )
+                    .await
                 }
             };
 
@@ -410,8 +460,9 @@ async fn run_session(
 
                 let config = config.clone();
                 let job_done_tx = job_done_tx.clone();
+                let job_log_tx = job_log_tx.clone();
                 tokio::spawn(async move {
-                    let completed = match execute_job(&config, &job).await {
+                    let completed = match execute_job(&config, &job, job_log_tx).await {
                         Ok(result) => CompletedJobStatus {
                             job_id: job.id.clone(),
                             status: result.status,
@@ -425,8 +476,7 @@ async fn run_session(
                     };
                     eprintln!(
                         "[statix-agent] job {}: completed locally with status {}",
-                        completed.job_id,
-                        completed.status
+                        completed.job_id, completed.status
                     );
                     let _ = job_done_tx.send(completed);
                 });
@@ -516,6 +566,12 @@ async fn run_session(
                     "[statix-agent] job {job_id}: {status} status update queued for websocket delivery"
                 );
             }
+            log = job_log_rx.recv() => {
+                let Some(log) = log else {
+                    return Err(anyhow!("job log channel closed"));
+                };
+                let _ = outbound_tx.send(OutboundMessage::JobLog(log));
+            }
             changed = stop_rx.changed() => {
                 if changed.is_ok() && *stop_rx.borrow() {
                     return Ok(SessionOutcome::Stopped);
@@ -587,9 +643,14 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     let system_info = collect_system_info(wireguard).await?;
-    send_client_message(ws, &ClientMessage::SystemInfo { payload: &system_info })
-        .await
-        .context("failed to publish system info payload")?;
+    send_client_message(
+        ws,
+        &ClientMessage::SystemInfo {
+            payload: &system_info,
+        },
+    )
+    .await
+    .context("failed to publish system info payload")?;
     *last_hash = Some(system_info.hash);
     *last_published_at = Some(Instant::now());
     log_verbose("system info payload published");
@@ -629,7 +690,11 @@ fn env_flag(name: &str) -> bool {
     )
 }
 
-async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<jobs::JobExecutionResult> {
+async fn execute_job(
+    config: &AgentConfig,
+    job: &AgentJob,
+    log_tx: mpsc::UnboundedSender<jobs::JobLogLine>,
+) -> Result<jobs::JobExecutionResult> {
     match &job.spec {
         AgentJobSpec::UpdateAgent {
             target_version,
@@ -663,20 +728,24 @@ async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<jobs::JobEx
             });
             let environment = match execution.environment.unwrap_or(JobEnvironment::Host) {
                 JobEnvironment::Host => RunnerEnvironment::Host,
-                JobEnvironment::Container { image, cpu, memory_mb } => {
-                    RunnerEnvironment::Container {
-                        image: image.unwrap_or_else(|| config.container_default_image.clone()),
-                        cpu: cpu.or(Some(config.container_default_cpu)),
-                        memory_mb: memory_mb.or(Some(config.container_default_memory_mb)),
-                    }
-                }
-                JobEnvironment::Microvm { image, cpu, memory_mb } => {
-                    RunnerEnvironment::Microvm {
-                        image: image.unwrap_or_else(|| config.microvm_default_image.clone()),
-                        cpu: cpu.or(Some(config.microvm_default_cpu)),
-                        memory_mb: memory_mb.or(Some(config.microvm_default_memory_mb)),
-                    }
-                }
+                JobEnvironment::Container {
+                    image,
+                    cpu,
+                    memory_mb,
+                } => RunnerEnvironment::Container {
+                    image: image.unwrap_or_else(|| config.container_default_image.clone()),
+                    cpu: cpu.or(Some(config.container_default_cpu)),
+                    memory_mb: memory_mb.or(Some(config.container_default_memory_mb)),
+                },
+                JobEnvironment::Microvm {
+                    image,
+                    cpu,
+                    memory_mb,
+                } => RunnerEnvironment::Microvm {
+                    image: image.unwrap_or_else(|| config.microvm_default_image.clone()),
+                    cpu: cpu.or(Some(config.microvm_default_cpu)),
+                    memory_mb: memory_mb.or(Some(config.microvm_default_memory_mb)),
+                },
             };
             eprintln!(
                 "[statix-agent] job {}: executing cargo_test in {} environment",
@@ -690,6 +759,7 @@ async fn execute_job(config: &AgentConfig, job: &AgentJob) -> Result<jobs::JobEx
                     job_id: execution.job_id.unwrap_or_else(|| job.id.clone()),
                     attempt_id: execution.attempt_id.unwrap_or_else(|| job.id.clone()),
                     timeout_seconds: timeout_seconds.unwrap_or(1800),
+                    log_tx: Some(log_tx),
                 },
                 &workspace,
                 &cargo_test_command(args),
@@ -734,7 +804,10 @@ fn shell_escape(value: &str) -> String {
         return "''".to_string();
     }
 
-    if value.chars().all(|character| character.is_ascii_alphanumeric() || "@%_-+=:,./".contains(character)) {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "@%_-+=:,./".contains(character))
+    {
         return value.to_string();
     }
 
@@ -754,9 +827,15 @@ async fn prepare_job_workdir(
             commit_sha,
             subdir,
         } => {
-            log_verbose(&format!("job {job_id}: materializing git checkout from {repo_url}"));
+            log_verbose(&format!(
+                "job {job_id}: materializing git checkout from {repo_url}"
+            ));
             let checkout_root = materialize_git_checkout(repo_url, git_ref, commit_sha).await?;
-            let workdir = match subdir.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            let workdir = match subdir
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
                 Some(value) => checkout_root.join(value),
                 None => checkout_root.clone(),
             };
@@ -765,10 +844,7 @@ async fn prepare_job_workdir(
                 bail!("resolved workdir does not exist: {}", workdir.display());
             }
 
-            Ok(PreparedWorkspace {
-                host_path: checkout_root,
-                workdir,
-            })
+            Ok(PreparedWorkspace { workdir })
         }
         JobSource::WorkspaceArchive { subdir, .. } => {
             log_verbose(&format!("job {job_id}: materializing workspace archive"));
@@ -786,15 +862,16 @@ async fn prepare_job_workdir(
                 bail!("resolved workdir does not exist: {}", workdir.display());
             }
 
-            Ok(PreparedWorkspace {
-                host_path: workspace_root,
-                workdir,
-            })
+            Ok(PreparedWorkspace { workdir })
         }
     }
 }
 
-async fn materialize_git_checkout(repo_url: &str, git_ref: &str, commit_sha: &str) -> Result<PathBuf> {
+async fn materialize_git_checkout(
+    repo_url: &str,
+    git_ref: &str,
+    commit_sha: &str,
+) -> Result<PathBuf> {
     let root = agent_state_dir()?.join("jobs").join("git");
     std::fs::create_dir_all(&root)
         .with_context(|| format!("failed to create {}", root.display()))?;
@@ -818,9 +895,12 @@ async fn materialize_git_checkout(repo_url: &str, git_ref: &str, commit_sha: &st
             .with_context(|| format!("failed to update origin url for {}", repo_dir.display()))?;
     }
 
-    run_git(&["fetch", "--depth", "1", "origin", git_ref], Some(&repo_dir))
-        .await
-        .with_context(|| format!("failed to fetch {git_ref} from {repo_url}"))?;
+    run_git(
+        &["fetch", "--depth", "1", "origin", git_ref],
+        Some(&repo_dir),
+    )
+    .await
+    .with_context(|| format!("failed to fetch {git_ref} from {repo_url}"))?;
 
     let fetched_commit = run_git_output(&["rev-parse", "FETCH_HEAD"], Some(&repo_dir))
         .await
@@ -867,10 +947,10 @@ async fn materialize_workspace_archive(config: &AgentConfig, job_id: &str) -> Re
 
 async fn download_job_source_archive(config: &AgentConfig, job_id: &str) -> Result<Vec<u8>> {
     let client = reqwest::Client::new();
-        let archive_url = format!("{}/jobs/{job_id}/source", config.api_base_url);
-        log_verbose(&format!("downloading source archive from {archive_url}"));
+    let archive_url = format!("{}/jobs/{job_id}/source", config.api_base_url);
+    log_verbose(&format!("downloading source archive from {archive_url}"));
     let response = client
-            .get(&archive_url)
+        .get(&archive_url)
         .header("x-statix-node-id", &config.node_id)
         .header("x-statix-node-token", &config.node_token)
         .send()
@@ -891,7 +971,10 @@ async fn download_job_source_archive(config: &AgentConfig, job_id: &str) -> Resu
     }
 
     let bytes = response.bytes().await?.to_vec();
-    log_verbose(&format!("downloaded source archive for job {job_id} ({} bytes)", bytes.len()));
+    log_verbose(&format!(
+        "downloaded source archive for job {job_id} ({} bytes)",
+        bytes.len()
+    ));
     Ok(bytes)
 }
 
@@ -950,7 +1033,11 @@ async fn run_git(args: &[&str], cwd: Option<&std::path::Path>) -> Result<()> {
         bail!(
             "git {} failed: {}",
             args.join(" "),
-            if stderr.is_empty() { "unknown error" } else { &stderr }
+            if stderr.is_empty() {
+                "unknown error"
+            } else {
+                &stderr
+            }
         );
     }
 
@@ -964,7 +1051,11 @@ async fn run_git_output(args: &[&str], cwd: Option<&std::path::Path>) -> Result<
         bail!(
             "git {} failed: {}",
             args.join(" "),
-            if stderr.is_empty() { "unknown error" } else { &stderr }
+            if stderr.is_empty() {
+                "unknown error"
+            } else {
+                &stderr
+            }
         );
     }
 
@@ -988,6 +1079,33 @@ fn hash_key(value: &str) -> String {
 }
 
 async fn request_update() -> Result<()> {
+    let mut runner = RealUpdateCommandRunner;
+    request_update_with(&mut runner).await
+}
+
+#[async_trait::async_trait]
+trait UpdateCommandRunner: Send {
+    async fn output(
+        &mut self,
+        program: &str,
+        args: &[&str],
+    ) -> std::io::Result<std::process::Output>;
+}
+
+struct RealUpdateCommandRunner;
+
+#[async_trait::async_trait]
+impl UpdateCommandRunner for RealUpdateCommandRunner {
+    async fn output(
+        &mut self,
+        program: &str,
+        args: &[&str],
+    ) -> std::io::Result<std::process::Output> {
+        TokioCommand::new(program).args(args).output().await
+    }
+}
+
+async fn request_update_with(runner: &mut dyn UpdateCommandRunner) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
         bail!("agent update requests are supported on Linux only");
@@ -999,10 +1117,8 @@ async fn request_update() -> Result<()> {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "statix-agent-update.service".to_owned());
-        let output = match TokioCommand::new("systemctl")
-            .arg("start")
-            .arg(&service)
-            .output()
+        let output = match runner
+            .output("systemctl", &["start", service.as_str()])
             .await
         {
             Ok(output) if output.status.success() => output,
@@ -1012,39 +1128,118 @@ async fn request_update() -> Result<()> {
                     || stderr.contains("access denied")
                     || stderr.contains("permission denied")
                 {
-                    TokioCommand::new("sudo")
-                        .arg("-n")
-                        .arg("systemctl")
-                        .arg("start")
-                        .arg(&service)
-                        .output()
+                    runner
+                        .output("sudo", &["-n", "systemctl", "start", service.as_str()])
                         .await
                         .context("failed to start update service via sudo")?
                 } else {
                     output
                 }
             }
-            Err(error) => {
-                TokioCommand::new("sudo")
-                    .arg("-n")
-                    .arg("systemctl")
-                    .arg("start")
-                    .arg(&service)
-                    .output()
-                    .await
-                    .with_context(|| format!("failed to start update service: {error}"))?
-            }
+            Err(error) => runner
+                .output("sudo", &["-n", "systemctl", "start", service.as_str()])
+                .await
+                .with_context(|| format!("failed to start update service: {error}"))?,
         };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             bail!(
                 "systemctl start {service} failed: {}",
-                if stderr.is_empty() { "unknown error" } else { stderr.as_str() }
+                if stderr.is_empty() {
+                    "unknown error"
+                } else {
+                    stderr.as_str()
+                }
             );
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, os::unix::process::ExitStatusExt, process::Output};
+
+    use super::*;
+
+    struct FakeUpdateCommandRunner {
+        calls: Vec<(String, Vec<String>)>,
+        responses: VecDeque<std::io::Result<Output>>,
+    }
+
+    impl FakeUpdateCommandRunner {
+        fn new(responses: Vec<std::io::Result<Output>>) -> Self {
+            Self {
+                calls: Vec::new(),
+                responses: responses.into(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UpdateCommandRunner for FakeUpdateCommandRunner {
+        async fn output(&mut self, program: &str, args: &[&str]) -> std::io::Result<Output> {
+            self.calls.push((
+                program.to_string(),
+                args.iter().map(|value| (*value).to_string()).collect(),
+            ));
+            self.responses.pop_front().unwrap_or_else(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected update command invocation",
+                ))
+            })
+        }
+    }
+
+    fn success_output() -> Output {
+        Output {
+            status: ExitStatusExt::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn permission_denied_output() -> Output {
+        Output {
+            status: ExitStatusExt::from_raw(1),
+            stdout: Vec::new(),
+            stderr: b"Permission denied".to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_update_falls_back_to_sudo_when_systemctl_is_denied() {
+        let mut runner = FakeUpdateCommandRunner::new(vec![
+            Ok(permission_denied_output()),
+            Ok(success_output()),
+        ]);
+
+        request_update_with(&mut runner).await.unwrap();
+
+        assert_eq!(
+            runner.calls,
+            vec![
+                (
+                    "systemctl".to_string(),
+                    vec![
+                        "start".to_string(),
+                        "statix-agent-update.service".to_string()
+                    ]
+                ),
+                (
+                    "sudo".to_string(),
+                    vec![
+                        "-n".to_string(),
+                        "systemctl".to_string(),
+                        "start".to_string(),
+                        "statix-agent-update.service".to_string()
+                    ]
+                ),
+            ]
+        );
     }
 }
 
@@ -1055,11 +1250,16 @@ where
     let ready = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
         loop {
             match ws.next().await {
-                Some(Ok(Message::Text(text))) => match serde_json::from_str::<ServerMessage>(&text) {
-                    Ok(ServerMessage::Ready { node_id: ready_node_id }) if ready_node_id == node_id => {
+                Some(Ok(Message::Text(text))) => match serde_json::from_str::<ServerMessage>(&text)
+                {
+                    Ok(ServerMessage::Ready {
+                        node_id: ready_node_id,
+                    }) if ready_node_id == node_id => {
                         return Ok(());
                     }
-                    Ok(ServerMessage::Ready { node_id: ready_node_id }) => {
+                    Ok(ServerMessage::Ready {
+                        node_id: ready_node_id,
+                    }) => {
                         bail!("websocket authenticated for unexpected node: {ready_node_id}");
                     }
                     Ok(ServerMessage::Error { error }) => {
@@ -1068,7 +1268,9 @@ where
                     Ok(ServerMessage::Job { .. }) | Err(_) => {}
                 },
                 Some(Ok(Message::Close(frame))) => {
-                    let reason = frame.map(|value| value.reason.to_string()).unwrap_or_else(|| "websocket closed during auth".to_owned());
+                    let reason = frame
+                        .map(|value| value.reason.to_string())
+                        .unwrap_or_else(|| "websocket closed during auth".to_owned());
                     bail!(reason);
                 }
                 Some(Ok(_)) => {}

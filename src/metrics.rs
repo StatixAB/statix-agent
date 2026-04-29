@@ -179,7 +179,7 @@ fn read_network_usage() -> (u64, u64) {
                 .unwrap_or(false)
             {
                 continue;
-            } 
+            }
 
             rx = rx.saturating_add(read_u64(path.join("statistics/rx_bytes")));
             tx = tx.saturating_add(read_u64(path.join("statistics/tx_bytes")));
@@ -223,7 +223,10 @@ fn parse_meminfo(content: &str) -> HashMap<String, u64> {
 }
 
 fn read_meminfo_value_bytes(values: &HashMap<String, u64>, key: &str) -> Option<u64> {
-    values.get(key).copied().map(|value| value.saturating_mul(1024))
+    values
+        .get(key)
+        .copied()
+        .map(|value| value.saturating_mul(1024))
 }
 
 fn parse_positive_number(raw: &str) -> Option<u64> {

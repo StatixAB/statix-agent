@@ -61,7 +61,18 @@ pub async fn collect_status(config: Option<&WireGuardConfig>) -> Option<WireGuar
     let config = config?;
 
     let wg_output = run_command("wg", &["show", config.interface_name.as_str(), "dump"]).await;
-    let addresses = match run_command("ip", &["-o", "address", "show", "dev", config.interface_name.as_str()]).await {
+    let addresses = match run_command(
+        "ip",
+        &[
+            "-o",
+            "address",
+            "show",
+            "dev",
+            config.interface_name.as_str(),
+        ],
+    )
+    .await
+    {
         Ok(output) => parse_interface_addresses(&output, &config.addresses),
         Err(_) => config.addresses.clone(),
     };
@@ -96,7 +107,8 @@ async fn generate_identity() -> Result<WireGuardIdentity> {
 
 fn write_runtime_config(config: &WireGuardConfig) -> Result<PathBuf> {
     let directory = agent_state_dir()?.join("wireguard");
-    fs::create_dir_all(&directory).with_context(|| format!("failed to create {}", directory.display()))?;
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("failed to create {}", directory.display()))?;
 
     let path = directory.join(format!("{}.conf", config.interface_name));
     fs::write(&path, render_config(config))
@@ -129,7 +141,10 @@ fn render_config(config: &WireGuardConfig) -> String {
     lines.push("[Peer]".to_owned());
     lines.push(format!("PublicKey = {}", config.server.public_key));
     lines.push(format!("Endpoint = {}", config.server.endpoint));
-    lines.push(format!("AllowedIPs = {}", config.server.allowed_ips.join(", ")));
+    lines.push(format!(
+        "AllowedIPs = {}",
+        config.server.allowed_ips.join(", ")
+    ));
 
     if let Some(preshared_key) = config.server.preshared_key.as_ref() {
         lines.push(format!("PresharedKey = {preshared_key}"));
@@ -143,7 +158,11 @@ fn render_config(config: &WireGuardConfig) -> String {
     lines.join("\n")
 }
 
-fn parse_status_dump(config: &WireGuardConfig, output: &str, addresses: Vec<String>) -> WireGuardStatus {
+fn parse_status_dump(
+    config: &WireGuardConfig,
+    output: &str,
+    addresses: Vec<String>,
+) -> WireGuardStatus {
     let mut lines = output.lines();
     let interface_line = lines.next().unwrap_or_default();
     let interface_parts: Vec<_> = interface_line.split('\t').collect();

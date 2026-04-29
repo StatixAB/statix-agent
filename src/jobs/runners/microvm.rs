@@ -1,18 +1,23 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::collections::VecDeque;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
-use tokio::{process::Command as TokioCommand, time::{sleep, timeout, Duration}};
+use tokio::{
+    process::Command as TokioCommand,
+    time::{Duration, sleep, timeout},
+};
 
 use crate::config::agent_state_dir;
-use crate::jobs::{summarize_command_output, ExecutionContext, JobExecutionResult, PreparedWorkspace, Runner};
+use crate::jobs::{
+    ExecutionContext, JobExecutionResult, PreparedWorkspace, Runner, summarize_command_output,
+};
 
 const DEFAULT_SSH_USER: &str = "statix";
 const DEFAULT_SSH_PORT: u16 = 2222;
@@ -55,7 +60,9 @@ impl QemuProcess {
         if logs.trim().is_empty() {
             format!("qemu exited before the guest became ready: {status}")
         } else {
-            format!("qemu exited before the guest became ready: {status}\nrecent qemu logs:\n{logs}")
+            format!(
+                "qemu exited before the guest became ready: {status}\nrecent qemu logs:\n{logs}"
+            )
         }
     }
 
@@ -86,7 +93,11 @@ impl Drop for QemuProcess {
 
 impl MicrovmRunner {
     pub fn new(image: String, cpu: Option<u8>, memory_mb: Option<u32>) -> Self {
-        Self { image, cpu, memory_mb }
+        Self {
+            image,
+            cpu,
+            memory_mb,
+        }
     }
 }
 
@@ -105,8 +116,12 @@ impl Runner for MicrovmRunner {
             bail!("run command must contain at least one token");
         }
 
-        let runtime_root = agent_state_dir()?.join("microvm").join(&ctx.job_id).join(&ctx.attempt_id);
-        fs::create_dir_all(&runtime_root).with_context(|| format!("failed to create {}", runtime_root.display()))?;
+        let runtime_root = agent_state_dir()?
+            .join("microvm")
+            .join(&ctx.job_id)
+            .join(&ctx.attempt_id);
+        fs::create_dir_all(&runtime_root)
+            .with_context(|| format!("failed to create {}", runtime_root.display()))?;
         eprintln!(
             "[statix-agent] job {}: preparing microvm runtime at {}",
             ctx.job_id,
@@ -128,11 +143,15 @@ impl Runner for MicrovmRunner {
         );
 
         let ssh_dir = runtime_root.join("ssh");
-        fs::create_dir_all(&ssh_dir).with_context(|| format!("failed to create {}", ssh_dir.display()))?;
+        fs::create_dir_all(&ssh_dir)
+            .with_context(|| format!("failed to create {}", ssh_dir.display()))?;
         let private_key = ssh_dir.join("id_ed25519");
         let public_key = ssh_dir.join("id_ed25519.pub");
         generate_ssh_keypair(&private_key, &public_key).await?;
-        eprintln!("[statix-agent] job {}: generated microvm ssh keypair", ctx.job_id);
+        eprintln!(
+            "[statix-agent] job {}: generated microvm ssh keypair",
+            ctx.job_id
+        );
 
         let seed_iso = runtime_root.join("seed.iso");
         let workspace_tar = runtime_root.join("workspace.tar.gz");
@@ -219,7 +238,8 @@ async fn resolve_base_image(image: &str, runtime_root: &Path) -> Result<PathBuf>
     };
 
     let cache_dir = runtime_root.join("images");
-    fs::create_dir_all(&cache_dir).with_context(|| format!("failed to create {}", cache_dir.display()))?;
+    fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("failed to create {}", cache_dir.display()))?;
     let cache_name = format!("{}.img", image_cache_key(&url));
     let cached_image = cache_dir.join(cache_name);
     if cached_image.exists() {
@@ -235,8 +255,12 @@ async fn resolve_base_image(image: &str, runtime_root: &Path) -> Result<PathBuf>
         .await
         .with_context(|| format!("failed to read microvm image from {url}"))?;
 
-    fs::write(&cached_image, &bytes)
-        .with_context(|| format!("failed to cache microvm image at {}", cached_image.display()))?;
+    fs::write(&cached_image, &bytes).with_context(|| {
+        format!(
+            "failed to cache microvm image at {}",
+            cached_image.display()
+        )
+    })?;
     Ok(cached_image)
 }
 
@@ -381,7 +405,13 @@ async fn launch_qemu(
     let binary = qemu_binary()?;
     let recent_logs = Arc::new(Mutex::new(VecDeque::with_capacity(32)));
     let mut command = Command::new(binary);
-    command.args(qemu_launch_args(overlay_image, seed_iso, cpu, memory_mb, ssh_port));
+    command.args(qemu_launch_args(
+        overlay_image,
+        seed_iso,
+        cpu,
+        memory_mb,
+        ssh_port,
+    ));
 
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -391,7 +421,10 @@ async fn launch_qemu(
         .with_context(|| missing_dependency_message(binary, qemu_package_hint()))?;
     spawn_qemu_log_stream("stdout", child.stdout.take(), Arc::clone(&recent_logs));
     spawn_qemu_log_stream("stderr", child.stderr.take(), Arc::clone(&recent_logs));
-    Ok(QemuProcess { child: Some(child), recent_logs })
+    Ok(QemuProcess {
+        child: Some(child),
+        recent_logs,
+    })
 }
 
 fn qemu_launch_args(
@@ -413,7 +446,10 @@ fn qemu_launch_args(
         "-drive".to_string(),
         format!("if=virtio,format=qcow2,file={}", overlay_image.display()),
         "-drive".to_string(),
-        format!("if=virtio,format=raw,file={},media=cdrom", seed_iso.display()),
+        format!(
+            "if=virtio,format=raw,file={},media=cdrom",
+            seed_iso.display()
+        ),
         "-netdev".to_string(),
         format!("user,id=net0,hostfwd=tcp::{}-:22", ssh_port),
         "-device".to_string(),
@@ -511,10 +547,10 @@ async fn wait_for_guest_ready(
 
         let last_probe_failure =
             match timeout(remaining.min(Duration::from_secs(5)), probe.output()).await {
-            Ok(Ok(output)) if output.status.success() => return Ok(()),
-            Ok(Ok(output)) => readiness_probe_failure(&output),
-            Ok(Err(error)) => format!("failed to launch ssh readiness probe: {error}"),
-            Err(_) => "ssh readiness probe timed out".to_string(),
+                Ok(Ok(output)) if output.status.success() => return Ok(()),
+                Ok(Ok(output)) => readiness_probe_failure(&output),
+                Ok(Err(error)) => format!("failed to launch ssh readiness probe: {error}"),
+                Err(_) => "ssh readiness probe timed out".to_string(),
             };
 
         let elapsed = start.elapsed();
@@ -543,25 +579,26 @@ async fn run_guest_command(
         "[statix-agent] uploading workspace archive to microvm from {}",
         workspace_tar.display()
     );
-    let upload = timeout(
-        Duration::from_secs(timeout_seconds),
-        async {
-            let mut scp = TokioCommand::new("scp");
-            scp.arg("-i").arg(private_key);
-            add_common_ssh_options(&mut scp, 5);
-            scp
-                .arg("-P")
-                .arg(ssh_port.to_string())
-                .arg(workspace_tar)
-                .arg(format!(
-                    "{}@127.0.0.1:/home/{}/workspace.tar.gz",
-                    DEFAULT_SSH_USER, DEFAULT_SSH_USER
-                ));
-            scp.output().await
-        },
-    )
+    let upload = timeout(Duration::from_secs(timeout_seconds), async {
+        let mut scp = TokioCommand::new("scp");
+        scp.arg("-i").arg(private_key);
+        add_common_ssh_options(&mut scp, 5);
+        scp.arg("-P")
+            .arg(ssh_port.to_string())
+            .arg(workspace_tar)
+            .arg(format!(
+                "{}@127.0.0.1:/home/{}/workspace.tar.gz",
+                DEFAULT_SSH_USER, DEFAULT_SSH_USER
+            ));
+        scp.output().await
+    })
     .await
-    .map_err(|_| anyhow!("microvm archive upload timed out after {} seconds", timeout_seconds))?
+    .map_err(|_| {
+        anyhow!(
+            "microvm archive upload timed out after {} seconds",
+            timeout_seconds
+        )
+    })?
     .map_err(anyhow::Error::from)
     .map_err(|error| error.context("failed to upload workspace archive to microvm"))?;
 
@@ -572,7 +609,11 @@ async fn run_guest_command(
         );
         return Ok(JobExecutionResult {
             status: "failed",
-            message: Some(summarize_command_output(&workspace.workdir, &upload.stdout, &upload.stderr)),
+            message: Some(summarize_command_output(
+                &workspace.workdir,
+                &upload.stdout,
+                &upload.stderr,
+            )),
         });
     }
     eprintln!("[statix-agent] uploaded workspace archive to microvm");
@@ -587,39 +628,46 @@ async fn run_guest_command(
         "[statix-agent] running command inside microvm: {}",
         shell_join(command)
     );
-    let output = timeout(
-        Duration::from_secs(timeout_seconds),
-        async {
-            let mut ssh = TokioCommand::new("ssh");
-            ssh.arg("-i").arg(private_key);
-            add_common_ssh_options(&mut ssh, 5);
-            ssh
-                .arg("-p")
-                .arg(ssh_port.to_string())
-                .arg(format!("{}@127.0.0.1", DEFAULT_SSH_USER))
-                .arg("sh")
-                .arg("-lc")
-                .arg(remote_command)
-                .current_dir(&workspace.workdir);
-            ssh.output().await
-        },
-    )
+    let output = timeout(Duration::from_secs(timeout_seconds), async {
+        let mut ssh = TokioCommand::new("ssh");
+        ssh.arg("-i").arg(private_key);
+        add_common_ssh_options(&mut ssh, 5);
+        ssh.arg("-p")
+            .arg(ssh_port.to_string())
+            .arg(format!("{}@127.0.0.1", DEFAULT_SSH_USER))
+            .arg("sh")
+            .arg("-lc")
+            .arg(remote_command)
+            .current_dir(&workspace.workdir);
+        ssh.output().await
+    })
     .await
-    .map_err(|_| anyhow!("microvm command timed out after {} seconds", timeout_seconds))?
+    .map_err(|_| {
+        anyhow!(
+            "microvm command timed out after {} seconds",
+            timeout_seconds
+        )
+    })?
     .map_err(anyhow::Error::from)
     .map_err(|error| error.context("failed to execute command inside microvm"))?;
 
     let message = summarize_command_output(&workspace.workdir, &output.stdout, &output.stderr);
     if output.status.success() {
         eprintln!("[statix-agent] microvm command succeeded");
-        Ok(JobExecutionResult { status: "succeeded", message: Some(message) })
+        Ok(JobExecutionResult {
+            status: "succeeded",
+            message: Some(message),
+        })
     } else {
         eprintln!(
             "[statix-agent] microvm command failed with {}; output: {}",
             output.status,
             truncate_for_log(&message, 1_000)
         );
-        Ok(JobExecutionResult { status: "failed", message: Some(message) })
+        Ok(JobExecutionResult {
+            status: "failed",
+            message: Some(message),
+        })
     }
 }
 
@@ -683,7 +731,10 @@ fn shell_escape(value: &str) -> String {
         return "''".to_string();
     }
 
-    if value.chars().all(|character| character.is_ascii_alphanumeric() || "@%_-+=:,./".contains(character)) {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "@%_-+=:,./".contains(character))
+    {
         return value.to_string();
     }
 
@@ -714,9 +765,14 @@ fn missing_dependency_message(program: &str, debian_package: &str) -> String {
 
 fn canonical_ubuntu_image_url() -> String {
     match std::env::consts::ARCH {
-        "x86_64" => "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img".to_string(),
-        "aarch64" => "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img".to_string(),
-        _ => "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img".to_string(),
+        "x86_64" => "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+            .to_string(),
+        "aarch64" => {
+            "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
+                .to_string()
+        }
+        _ => "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+            .to_string(),
     }
 }
 

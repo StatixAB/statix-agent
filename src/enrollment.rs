@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
 use crate::{
-    config::{LoginConfig, PersistedAgentConfig, WireGuardConfig, WireGuardPeerConfig, save_persisted_config},
+    config::{
+        LoginConfig, PersistedAgentConfig, WireGuardConfig, WireGuardPeerConfig,
+        save_persisted_config,
+    },
     system_info::{collect_mac_addresses, collect_system_info},
     wireguard::resolve_or_generate_identity,
 };
@@ -94,7 +97,31 @@ struct EnrollmentWireGuardPeerConfig {
     persistent_keepalive_seconds: Option<u16>,
 }
 
+fn check_dependencies() -> Result<()> {
+    let required_cmds = ["wg", "ip", "tar"];
+    let mut missing = Vec::new();
+
+    for cmd in required_cmds.iter() {
+        if let Err(e) = std::process::Command::new(cmd).arg("--version").output() {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                missing.push(*cmd);
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        bail!(
+            "Missing required dependencies: {}. Please install them before proceeding.",
+            missing.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
 pub async fn run_login(login_config: LoginConfig, options: LoginOptions) -> Result<()> {
+    check_dependencies()?;
+
     let client = Client::new();
     let wireguard_identity = resolve_or_generate_identity().await?;
     let system_info = collect_system_info(None).await?;
@@ -130,7 +157,10 @@ pub async fn run_login(login_config: LoginConfig, options: LoginOptions) -> Resu
         .context("failed to start node enrollment")?;
 
     let status = start_response.status();
-    let start_payload = start_response.text().await.context("failed to read enrollment response")?;
+    let start_payload = start_response
+        .text()
+        .await
+        .context("failed to read enrollment response")?;
     if !status.is_success() {
         bail!(
             "enrollment start failed ({}): {}",
@@ -163,7 +193,10 @@ pub async fn run_login(login_config: LoginConfig, options: LoginOptions) -> Resu
             .context("failed to poll enrollment")?;
 
         let poll_status = poll_response.status();
-        let poll_payload = poll_response.text().await.context("failed to read poll response")?;
+        let poll_payload = poll_response
+            .text()
+            .await
+            .context("failed to read poll response")?;
 
         if poll_status == reqwest::StatusCode::CONFLICT {
             bail!(
