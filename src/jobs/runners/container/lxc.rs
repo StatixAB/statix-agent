@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::AsyncReadExt,
     process::Command as TokioCommand,
     time::{Duration, timeout},
 };
@@ -247,15 +247,22 @@ impl LxcContainer {
         workspace: &PreparedWorkspace,
     ) -> Result<Option<JobExecutionResult>> {
         let setup_command = concat!(
+            "set -e; ",
             "echo '[statix-agent] guest network diagnostics:'; ",
             "echo '[statix-agent] ip addr:'; ip addr || true; ",
             "echo '[statix-agent] ip route:'; ip route || true; ",
             "echo '[statix-agent] /etc/resolv.conf:'; cat /etc/resolv.conf || true; ",
-            "command -v cargo >/dev/null 2>&1 || ",
-            "(apt-get update && ",
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl git libssl-dev pkg-config && ",
+            "if command -v cargo >/dev/null 2>&1; then ",
+            "echo '[statix-agent] cargo already available'; ",
+            "else ",
+            "echo '[statix-agent] apt-get update'; ",
+            "apt-get update; ",
+            "echo '[statix-agent] installing build dependencies'; ",
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl git libssl-dev pkg-config; ",
+            "echo '[statix-agent] installing rust toolchain'; ",
             "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | ",
-            "sh -s -- -y --profile minimal --default-toolchain stable)"
+            "sh -s -- -y --profile minimal --default-toolchain stable; ",
+            "fi"
         );
         let output = self
             .attach_output(timeout_seconds, setup_command, Some(ctx))
@@ -454,14 +461,14 @@ async fn stream_and_collect_output(
     stream_name: JobLogStream,
     ctx: Option<ExecutionContext>,
 ) -> Result<Vec<u8>> {
-    let mut reader = BufReader::new(stream);
+    let mut reader = stream;
     let mut buffer = Vec::new();
-    let mut line = Vec::new();
+    let mut pending = Vec::new();
+    let mut chunk = [0_u8; 8192];
 
     loop {
-        line.clear();
         let bytes_read = reader
-            .read_until(b'\n', &mut line)
+            .read(&mut chunk)
             .await
             .context("failed to read streamed output from lxc-attach")?;
 
@@ -469,22 +476,42 @@ async fn stream_and_collect_output(
             break;
         }
 
-        buffer.extend_from_slice(&line);
-        let message = String::from_utf8_lossy(&line);
-        let channel = stream_name.as_str();
-        eprint!(
-            "[statix-agent] lxc container {} {} | {}",
-            container_name, channel, message
-        );
-        if let Some(ctx) = &ctx {
-            ctx.emit_log(
-                stream_name,
-                message.trim_end_matches(['\r', '\n']).to_owned(),
-            );
+        for byte in &chunk[..bytes_read] {
+            buffer.push(*byte);
+            if matches!(*byte, b'\n' | b'\r') {
+                emit_stream_segment(container_name, stream_name, &pending, ctx.as_ref());
+                pending.clear();
+            } else {
+                pending.push(*byte);
+            }
         }
     }
 
+    emit_stream_segment(container_name, stream_name, &pending, ctx.as_ref());
+
     Ok(buffer)
+}
+
+fn emit_stream_segment(
+    container_name: &str,
+    stream_name: JobLogStream,
+    segment: &[u8],
+    ctx: Option<&ExecutionContext>,
+) {
+    if segment.is_empty() {
+        return;
+    }
+
+    let message = String::from_utf8_lossy(segment);
+    eprintln!(
+        "[statix-agent] lxc container {} {} | {}",
+        container_name,
+        stream_name.as_str(),
+        message
+    );
+    if let Some(ctx) = ctx {
+        ctx.emit_log(stream_name, message.into_owned());
+    }
 }
 
 impl Drop for LxcContainer {
