@@ -1,7 +1,9 @@
 use anyhow::{Result, anyhow, bail};
 use tokio::{process::Command as TokioCommand, time::Duration};
 
-use crate::jobs::{ExecutionContext, JobExecutionResult, PreparedWorkspace, Runner, summarize_command_output};
+use crate::jobs::{
+    ExecutionContext, JobExecutionResult, PreparedWorkspace, Runner, summarize_command_output,
+};
 
 pub struct HostRunner;
 
@@ -25,18 +27,19 @@ impl Runner for HostRunner {
         process.current_dir(&workspace.workdir);
         process.kill_on_drop(true);
 
-        let output = tokio::time::timeout(Duration::from_secs(ctx.timeout_seconds), process.output())
-            .await
-            .map_err(|_| anyhow!("command timed out after {} seconds", ctx.timeout_seconds))?
-            .map_err(anyhow::Error::from)
-            .map_err(|error| {
-                error.context(format!(
-                    "failed to run {} in {} for attempt {}",
-                    command[0],
-                    workspace.workdir.display(),
-                    ctx.attempt_id
-                ))
-            })?;
+        let output =
+            tokio::time::timeout(Duration::from_secs(ctx.timeout_seconds), process.output())
+                .await
+                .map_err(|_| anyhow!("command timed out after {} seconds", ctx.timeout_seconds))?
+                .map_err(anyhow::Error::from)
+                .map_err(|error| {
+                    error.context(format!(
+                        "failed to run {} in {} for attempt {}",
+                        command[0],
+                        workspace.workdir.display(),
+                        ctx.attempt_id
+                    ))
+                })?;
 
         let message = summarize_command_output(&workspace.workdir, &output.stdout, &output.stderr);
         if output.status.success() {

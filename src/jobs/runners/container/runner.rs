@@ -87,7 +87,9 @@ impl Runner for ContainerRunner {
 
         let result = async {
             container.start().await?;
-            container.configure_guest_network(ctx.timeout_seconds).await?;
+            container
+                .configure_guest_network(ctx.timeout_seconds)
+                .await?;
             container.configure_guest_dns(ctx.timeout_seconds).await?;
             if let Some(result) = container
                 .prepare_guest(ctx, ctx.timeout_seconds, workspace)

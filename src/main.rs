@@ -20,8 +20,8 @@ use enrollment::{LoginOptions, run_login};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    select, signal,
     process::Command as TokioCommand,
+    select, signal,
     sync::{mpsc, watch},
     time::{MissedTickBehavior, interval},
 };
@@ -38,11 +38,20 @@ use crate::{
 #[serde(tag = "type")]
 enum ClientMessage<'a> {
     #[serde(rename = "auth")]
-    Auth { #[serde(rename = "nodeId")] node_id: &'a str, #[serde(rename = "nodeToken")] node_token: &'a str },
+    Auth {
+        #[serde(rename = "nodeId")]
+        node_id: &'a str,
+        #[serde(rename = "nodeToken")]
+        node_token: &'a str,
+    },
     #[serde(rename = "metrics")]
-    Metrics { payload: &'a metrics::MetricsPayload },
+    Metrics {
+        payload: &'a metrics::MetricsPayload,
+    },
     #[serde(rename = "system_info")]
-    SystemInfo { payload: &'a system_info::SystemInfoPayload },
+    SystemInfo {
+        payload: &'a system_info::SystemInfoPayload,
+    },
     #[serde(rename = "job_status")]
     JobStatus {
         #[serde(rename = "jobId")]
@@ -66,7 +75,10 @@ enum ClientMessage<'a> {
 #[serde(tag = "type")]
 enum ServerMessage {
     #[serde(rename = "ready")]
-    Ready { #[serde(rename = "nodeId")] node_id: String },
+    Ready {
+        #[serde(rename = "nodeId")]
+        node_id: String,
+    },
     #[serde(rename = "error")]
     Error { error: String },
     #[serde(rename = "job")]
@@ -253,13 +265,13 @@ async fn run_agent() -> Result<()> {
         "Agent identity not configured. Run `statix login --api-base-url http://host:3001` or set NODE_ID/NODE_TOKEN in the environment.",
     )?;
     eprintln!("[statix-agent] starting with nodeId: {}", config.node_id);
-        log_verbose(&format!(
-            "runtime config: ws={}, api={}, publish={}ms, system-check={}ms",
-            config.agent_ws_url,
-            config.api_base_url,
-            config.publish_interval_ms,
-            config.system_info_check_interval_ms
-        ));
+    log_verbose(&format!(
+        "runtime config: ws={}, api={}, publish={}ms, system-check={}ms",
+        config.agent_ws_url,
+        config.api_base_url,
+        config.publish_interval_ms,
+        config.system_info_check_interval_ms
+    ));
 
     if let Some(wireguard) = config
         .wireguard
@@ -320,7 +332,12 @@ async fn run_session(
         connect_async(config.agent_ws_url.as_str()),
     )
     .await
-    .map_err(|_| anyhow!("ws connect timed out after {} ms", config.connect_timeout_ms))?
+    .map_err(|_| {
+        anyhow!(
+            "ws connect timed out after {} ms",
+            config.connect_timeout_ms
+        )
+    })?
     .context("failed to connect websocket")?;
     let (mut ws, _) = connect;
 
@@ -350,7 +367,9 @@ async fn run_session(
         config.wireguard.as_ref(),
         &mut last_system_info_hash,
         &mut last_system_info_published_at,
-    ).await {
+    )
+    .await
+    {
         eprintln!("[statix-agent] system info publish failed: {error:#}");
     }
 
@@ -395,10 +414,18 @@ async fn run_session(
                     .await
                 }
                 OutboundMessage::Metrics(payload) => {
-                    send_client_message(&mut ws_write, &ClientMessage::Metrics { payload: &payload }).await
+                    send_client_message(
+                        &mut ws_write,
+                        &ClientMessage::Metrics { payload: &payload },
+                    )
+                    .await
                 }
                 OutboundMessage::SystemInfo(payload) => {
-                    send_client_message(&mut ws_write, &ClientMessage::SystemInfo { payload: &payload }).await
+                    send_client_message(
+                        &mut ws_write,
+                        &ClientMessage::SystemInfo { payload: &payload },
+                    )
+                    .await
                 }
             };
 
@@ -449,8 +476,7 @@ async fn run_session(
                     };
                     eprintln!(
                         "[statix-agent] job {}: completed locally with status {}",
-                        completed.job_id,
-                        completed.status
+                        completed.job_id, completed.status
                     );
                     let _ = job_done_tx.send(completed);
                 });
@@ -617,9 +643,14 @@ where
     S::Error: std::error::Error + Send + Sync + 'static,
 {
     let system_info = collect_system_info(wireguard).await?;
-    send_client_message(ws, &ClientMessage::SystemInfo { payload: &system_info })
-        .await
-        .context("failed to publish system info payload")?;
+    send_client_message(
+        ws,
+        &ClientMessage::SystemInfo {
+            payload: &system_info,
+        },
+    )
+    .await
+    .context("failed to publish system info payload")?;
     *last_hash = Some(system_info.hash);
     *last_published_at = Some(Instant::now());
     log_verbose("system info payload published");
@@ -697,20 +728,24 @@ async fn execute_job(
             });
             let environment = match execution.environment.unwrap_or(JobEnvironment::Host) {
                 JobEnvironment::Host => RunnerEnvironment::Host,
-                JobEnvironment::Container { image, cpu, memory_mb } => {
-                    RunnerEnvironment::Container {
-                        image: image.unwrap_or_else(|| config.container_default_image.clone()),
-                        cpu: cpu.or(Some(config.container_default_cpu)),
-                        memory_mb: memory_mb.or(Some(config.container_default_memory_mb)),
-                    }
-                }
-                JobEnvironment::Microvm { image, cpu, memory_mb } => {
-                    RunnerEnvironment::Microvm {
-                        image: image.unwrap_or_else(|| config.microvm_default_image.clone()),
-                        cpu: cpu.or(Some(config.microvm_default_cpu)),
-                        memory_mb: memory_mb.or(Some(config.microvm_default_memory_mb)),
-                    }
-                }
+                JobEnvironment::Container {
+                    image,
+                    cpu,
+                    memory_mb,
+                } => RunnerEnvironment::Container {
+                    image: image.unwrap_or_else(|| config.container_default_image.clone()),
+                    cpu: cpu.or(Some(config.container_default_cpu)),
+                    memory_mb: memory_mb.or(Some(config.container_default_memory_mb)),
+                },
+                JobEnvironment::Microvm {
+                    image,
+                    cpu,
+                    memory_mb,
+                } => RunnerEnvironment::Microvm {
+                    image: image.unwrap_or_else(|| config.microvm_default_image.clone()),
+                    cpu: cpu.or(Some(config.microvm_default_cpu)),
+                    memory_mb: memory_mb.or(Some(config.microvm_default_memory_mb)),
+                },
             };
             eprintln!(
                 "[statix-agent] job {}: executing cargo_test in {} environment",
@@ -769,7 +804,10 @@ fn shell_escape(value: &str) -> String {
         return "''".to_string();
     }
 
-    if value.chars().all(|character| character.is_ascii_alphanumeric() || "@%_-+=:,./".contains(character)) {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "@%_-+=:,./".contains(character))
+    {
         return value.to_string();
     }
 
@@ -789,9 +827,15 @@ async fn prepare_job_workdir(
             commit_sha,
             subdir,
         } => {
-            log_verbose(&format!("job {job_id}: materializing git checkout from {repo_url}"));
+            log_verbose(&format!(
+                "job {job_id}: materializing git checkout from {repo_url}"
+            ));
             let checkout_root = materialize_git_checkout(repo_url, git_ref, commit_sha).await?;
-            let workdir = match subdir.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            let workdir = match subdir
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
                 Some(value) => checkout_root.join(value),
                 None => checkout_root.clone(),
             };
@@ -800,9 +844,7 @@ async fn prepare_job_workdir(
                 bail!("resolved workdir does not exist: {}", workdir.display());
             }
 
-            Ok(PreparedWorkspace {
-                workdir,
-            })
+            Ok(PreparedWorkspace { workdir })
         }
         JobSource::WorkspaceArchive { subdir, .. } => {
             log_verbose(&format!("job {job_id}: materializing workspace archive"));
@@ -820,14 +862,16 @@ async fn prepare_job_workdir(
                 bail!("resolved workdir does not exist: {}", workdir.display());
             }
 
-            Ok(PreparedWorkspace {
-                workdir,
-            })
+            Ok(PreparedWorkspace { workdir })
         }
     }
 }
 
-async fn materialize_git_checkout(repo_url: &str, git_ref: &str, commit_sha: &str) -> Result<PathBuf> {
+async fn materialize_git_checkout(
+    repo_url: &str,
+    git_ref: &str,
+    commit_sha: &str,
+) -> Result<PathBuf> {
     let root = agent_state_dir()?.join("jobs").join("git");
     std::fs::create_dir_all(&root)
         .with_context(|| format!("failed to create {}", root.display()))?;
@@ -851,9 +895,12 @@ async fn materialize_git_checkout(repo_url: &str, git_ref: &str, commit_sha: &st
             .with_context(|| format!("failed to update origin url for {}", repo_dir.display()))?;
     }
 
-    run_git(&["fetch", "--depth", "1", "origin", git_ref], Some(&repo_dir))
-        .await
-        .with_context(|| format!("failed to fetch {git_ref} from {repo_url}"))?;
+    run_git(
+        &["fetch", "--depth", "1", "origin", git_ref],
+        Some(&repo_dir),
+    )
+    .await
+    .with_context(|| format!("failed to fetch {git_ref} from {repo_url}"))?;
 
     let fetched_commit = run_git_output(&["rev-parse", "FETCH_HEAD"], Some(&repo_dir))
         .await
@@ -900,10 +947,10 @@ async fn materialize_workspace_archive(config: &AgentConfig, job_id: &str) -> Re
 
 async fn download_job_source_archive(config: &AgentConfig, job_id: &str) -> Result<Vec<u8>> {
     let client = reqwest::Client::new();
-        let archive_url = format!("{}/jobs/{job_id}/source", config.api_base_url);
-        log_verbose(&format!("downloading source archive from {archive_url}"));
+    let archive_url = format!("{}/jobs/{job_id}/source", config.api_base_url);
+    log_verbose(&format!("downloading source archive from {archive_url}"));
     let response = client
-            .get(&archive_url)
+        .get(&archive_url)
         .header("x-statix-node-id", &config.node_id)
         .header("x-statix-node-token", &config.node_token)
         .send()
@@ -924,7 +971,10 @@ async fn download_job_source_archive(config: &AgentConfig, job_id: &str) -> Resu
     }
 
     let bytes = response.bytes().await?.to_vec();
-    log_verbose(&format!("downloaded source archive for job {job_id} ({} bytes)", bytes.len()));
+    log_verbose(&format!(
+        "downloaded source archive for job {job_id} ({} bytes)",
+        bytes.len()
+    ));
     Ok(bytes)
 }
 
@@ -983,7 +1033,11 @@ async fn run_git(args: &[&str], cwd: Option<&std::path::Path>) -> Result<()> {
         bail!(
             "git {} failed: {}",
             args.join(" "),
-            if stderr.is_empty() { "unknown error" } else { &stderr }
+            if stderr.is_empty() {
+                "unknown error"
+            } else {
+                &stderr
+            }
         );
     }
 
@@ -997,7 +1051,11 @@ async fn run_git_output(args: &[&str], cwd: Option<&std::path::Path>) -> Result<
         bail!(
             "git {} failed: {}",
             args.join(" "),
-            if stderr.is_empty() { "unknown error" } else { &stderr }
+            if stderr.is_empty() {
+                "unknown error"
+            } else {
+                &stderr
+            }
         );
     }
 
@@ -1027,14 +1085,22 @@ async fn request_update() -> Result<()> {
 
 #[async_trait::async_trait]
 trait UpdateCommandRunner: Send {
-    async fn output(&mut self, program: &str, args: &[&str]) -> std::io::Result<std::process::Output>;
+    async fn output(
+        &mut self,
+        program: &str,
+        args: &[&str],
+    ) -> std::io::Result<std::process::Output>;
 }
 
 struct RealUpdateCommandRunner;
 
 #[async_trait::async_trait]
 impl UpdateCommandRunner for RealUpdateCommandRunner {
-    async fn output(&mut self, program: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    async fn output(
+        &mut self,
+        program: &str,
+        args: &[&str],
+    ) -> std::io::Result<std::process::Output> {
         TokioCommand::new(program).args(args).output().await
     }
 }
@@ -1051,7 +1117,10 @@ async fn request_update_with(runner: &mut dyn UpdateCommandRunner) -> Result<()>
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "statix-agent-update.service".to_owned());
-        let output = match runner.output("systemctl", &["start", service.as_str()]).await {
+        let output = match runner
+            .output("systemctl", &["start", service.as_str()])
+            .await
+        {
             Ok(output) if output.status.success() => output,
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
@@ -1067,19 +1136,21 @@ async fn request_update_with(runner: &mut dyn UpdateCommandRunner) -> Result<()>
                     output
                 }
             }
-            Err(error) => {
-                runner
-                    .output("sudo", &["-n", "systemctl", "start", service.as_str()])
-                    .await
-                    .with_context(|| format!("failed to start update service: {error}"))?
-            }
+            Err(error) => runner
+                .output("sudo", &["-n", "systemctl", "start", service.as_str()])
+                .await
+                .with_context(|| format!("failed to start update service: {error}"))?,
         };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             bail!(
                 "systemctl start {service} failed: {}",
-                if stderr.is_empty() { "unknown error" } else { stderr.as_str() }
+                if stderr.is_empty() {
+                    "unknown error"
+                } else {
+                    stderr.as_str()
+                }
             );
         }
 
@@ -1100,14 +1171,20 @@ mod tests {
 
     impl FakeUpdateCommandRunner {
         fn new(responses: Vec<std::io::Result<Output>>) -> Self {
-            Self { calls: Vec::new(), responses: responses.into(), }
+            Self {
+                calls: Vec::new(),
+                responses: responses.into(),
+            }
         }
     }
 
     #[async_trait::async_trait]
     impl UpdateCommandRunner for FakeUpdateCommandRunner {
         async fn output(&mut self, program: &str, args: &[&str]) -> std::io::Result<Output> {
-            self.calls.push((program.to_string(), args.iter().map(|value| (*value).to_string()).collect()));
+            self.calls.push((
+                program.to_string(),
+                args.iter().map(|value| (*value).to_string()).collect(),
+            ));
             self.responses.pop_front().unwrap_or_else(|| {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -1142,10 +1219,27 @@ mod tests {
 
         request_update_with(&mut runner).await.unwrap();
 
-        assert_eq!(runner.calls, vec![
-            ("systemctl".to_string(), vec!["start".to_string(), "statix-agent-update.service".to_string()]),
-            ("sudo".to_string(), vec!["-n".to_string(), "systemctl".to_string(), "start".to_string(), "statix-agent-update.service".to_string()]),
-        ]);
+        assert_eq!(
+            runner.calls,
+            vec![
+                (
+                    "systemctl".to_string(),
+                    vec![
+                        "start".to_string(),
+                        "statix-agent-update.service".to_string()
+                    ]
+                ),
+                (
+                    "sudo".to_string(),
+                    vec![
+                        "-n".to_string(),
+                        "systemctl".to_string(),
+                        "start".to_string(),
+                        "statix-agent-update.service".to_string()
+                    ]
+                ),
+            ]
+        );
     }
 }
 
@@ -1156,11 +1250,16 @@ where
     let ready = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
         loop {
             match ws.next().await {
-                Some(Ok(Message::Text(text))) => match serde_json::from_str::<ServerMessage>(&text) {
-                    Ok(ServerMessage::Ready { node_id: ready_node_id }) if ready_node_id == node_id => {
+                Some(Ok(Message::Text(text))) => match serde_json::from_str::<ServerMessage>(&text)
+                {
+                    Ok(ServerMessage::Ready {
+                        node_id: ready_node_id,
+                    }) if ready_node_id == node_id => {
                         return Ok(());
                     }
-                    Ok(ServerMessage::Ready { node_id: ready_node_id }) => {
+                    Ok(ServerMessage::Ready {
+                        node_id: ready_node_id,
+                    }) => {
                         bail!("websocket authenticated for unexpected node: {ready_node_id}");
                     }
                     Ok(ServerMessage::Error { error }) => {
@@ -1169,7 +1268,9 @@ where
                     Ok(ServerMessage::Job { .. }) | Err(_) => {}
                 },
                 Some(Ok(Message::Close(frame))) => {
-                    let reason = frame.map(|value| value.reason.to_string()).unwrap_or_else(|| "websocket closed during auth".to_owned());
+                    let reason = frame
+                        .map(|value| value.reason.to_string())
+                        .unwrap_or_else(|| "websocket closed during auth".to_owned());
                     bail!(reason);
                 }
                 Some(Ok(_)) => {}

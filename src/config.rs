@@ -64,7 +64,11 @@ pub struct WireGuardPeerConfig {
     pub endpoint: String,
     #[serde(rename = "allowedIps")]
     pub allowed_ips: Vec<String>,
-    #[serde(rename = "presharedKey", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "presharedKey",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub preshared_key: Option<String>,
     #[serde(
         rename = "persistentKeepaliveSeconds",
@@ -100,16 +104,26 @@ impl AgentConfig {
                     .map(|value| {
                         let ws_path =
                             env::var("NODE_WS_PATH").unwrap_or_else(|_| "/ws/agent".to_owned());
-                        format!("{}{}", to_ws_base_url(&trim_trailing_slash(&value)), normalize_path(&ws_path))
+                        format!(
+                            "{}{}",
+                            to_ws_base_url(&trim_trailing_slash(&value)),
+                            normalize_path(&ws_path)
+                        )
                     })
             })
             .or_else(|| persisted.as_ref().map(|value| value.agent_ws_url.clone()))?;
-        let api_base_url = normalize_api_base_url(&env::var("API_BASE_URL")
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .or_else(|| persisted.as_ref().and_then(|value| value.api_base_url.clone()))
-            .unwrap_or_else(|| api_base_url_from_ws_url(&agent_ws_url)));
+        let api_base_url = normalize_api_base_url(
+            &env::var("API_BASE_URL")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    persisted
+                        .as_ref()
+                        .and_then(|value| value.api_base_url.clone())
+                })
+                .unwrap_or_else(|| api_base_url_from_ws_url(&agent_ws_url)),
+        );
 
         Some(Self {
             node_id,
@@ -117,7 +131,10 @@ impl AgentConfig {
             agent_ws_url,
             api_base_url,
             publish_interval_ms: parse_positive_int("PUBLISH_INTERVAL_MS", 5_000),
-            system_info_check_interval_ms: parse_positive_int("SYSTEM_INFO_CHECK_INTERVAL_MS", 10 * 60_000),
+            system_info_check_interval_ms: parse_positive_int(
+                "SYSTEM_INFO_CHECK_INTERVAL_MS",
+                10 * 60_000,
+            ),
             system_info_republish_interval_ms: parse_positive_int(
                 "SYSTEM_INFO_REPUBLISH_INTERVAL_MS",
                 24 * 60 * 60_000,
@@ -161,7 +178,8 @@ pub fn load_persisted_config_snapshot() -> Result<Option<PersistedAgentConfig>> 
 pub fn save_persisted_config(config: &PersistedAgentConfig) -> Result<PathBuf> {
     let path = persisted_config_path()?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
     let payload = serde_json::to_string_pretty(config)?;
@@ -197,9 +215,10 @@ fn load_persisted_config() -> Result<Option<PersistedAgentConfig>> {
         return Ok(None);
     }
 
-    let raw = fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let parsed =
-        serde_json::from_str::<PersistedAgentConfig>(&raw).with_context(|| format!("invalid {}", path.display()))?;
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let parsed = serde_json::from_str::<PersistedAgentConfig>(&raw)
+        .with_context(|| format!("invalid {}", path.display()))?;
     Ok(Some(parsed))
 }
 
@@ -339,7 +358,9 @@ fn resolve_wireguard_config(persisted: Option<&PersistedAgentConfig>) -> Option<
             addresses
         };
         let dns = if dns.is_empty() {
-            persisted_wireguard.map(|value| value.dns.clone()).unwrap_or_default()
+            persisted_wireguard
+                .map(|value| value.dns.clone())
+                .unwrap_or_default()
         } else {
             dns
         };
@@ -380,7 +401,12 @@ fn resolve_wireguard_config(persisted: Option<&PersistedAgentConfig>) -> Option<
 fn env_flag(name: &str) -> bool {
     env::var(name)
         .ok()
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 

@@ -34,6 +34,35 @@ pub(super) struct LxcContainer {
 }
 
 impl LxcContainer {
+    fn check_dependencies() -> Result<()> {
+        let required_cmds = [
+            "lxc-create",
+            "lxc-start",
+            "lxc-wait",
+            "lxc-attach",
+            "lxc-stop",
+            "lxc-destroy",
+        ];
+        let mut missing = Vec::new();
+
+        for cmd in required_cmds.iter() {
+            if let Err(e) = StdCommand::new(cmd).arg("--version").output() {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    missing.push(*cmd);
+                }
+            }
+        }
+
+        if !missing.is_empty() {
+            bail!(
+                "Missing required LXC dependencies: {}. Please install the 'lxc' package before creating containers.",
+                missing.join(", ")
+            );
+        }
+
+        Ok(())
+    }
+
     pub(super) async fn create(
         name: String,
         distribution: &str,
@@ -41,6 +70,8 @@ impl LxcContainer {
         cpu: u8,
         memory_mb: u32,
     ) -> Result<Self> {
+        Self::check_dependencies()?;
+
         ensure_lxc_directory_permissions()?;
 
         let lxc_path = lxc_storage_path();
@@ -348,12 +379,15 @@ impl LxcContainer {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = process.spawn().map_err(anyhow::Error::from).map_err(|error| {
-            error.context(format!(
-                "failed to execute command inside lxc container {}",
-                self.name
-            ))
-        })?;
+        let mut child = process
+            .spawn()
+            .map_err(anyhow::Error::from)
+            .map_err(|error| {
+                error.context(format!(
+                    "failed to execute command inside lxc container {}",
+                    self.name
+                ))
+            })?;
 
         let stdout = child
             .stdout
@@ -579,7 +613,8 @@ fn ensure_lxc_directory_permissions() -> Result<()> {
 fn set_traversable_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let metadata = fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
     if !metadata.is_dir() {
         return Ok(());
     }

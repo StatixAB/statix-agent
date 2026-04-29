@@ -83,13 +83,25 @@ pub async fn execute(
     command: &[String],
 ) -> Result<JobExecutionResult> {
     match environment {
-        RunnerEnvironment::Host => runners::host::HostRunner.execute(ctx, workspace, command).await,
-        RunnerEnvironment::Container { image, cpu, memory_mb } => {
+        RunnerEnvironment::Host => {
+            runners::host::HostRunner
+                .execute(ctx, workspace, command)
+                .await
+        }
+        RunnerEnvironment::Container {
+            image,
+            cpu,
+            memory_mb,
+        } => {
             runners::container::ContainerRunner::new(image.clone(), *cpu, *memory_mb)
                 .execute(ctx, workspace, command)
                 .await
         }
-        RunnerEnvironment::Microvm { image, cpu, memory_mb } => {
+        RunnerEnvironment::Microvm {
+            image,
+            cpu,
+            memory_mb,
+        } => {
             runners::microvm::MicrovmRunner::new(image.clone(), *cpu, *memory_mb)
                 .execute(ctx, workspace, command)
                 .await
@@ -107,11 +119,7 @@ pub(crate) trait Runner {
     ) -> Result<JobExecutionResult>;
 }
 
-pub(crate) fn summarize_command_output(
-    cwd: &Path,
-    stdout: &[u8],
-    stderr: &[u8],
-) -> String {
+pub(crate) fn summarize_command_output(cwd: &Path, stdout: &[u8], stderr: &[u8]) -> String {
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
 
