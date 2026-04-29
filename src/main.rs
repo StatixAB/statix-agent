@@ -114,7 +114,7 @@ enum AgentJobSpec {
         target_version: Option<String>,
         channel: Option<String>,
         #[serde(default)]
-        execution: Option<JobExecutionConfig>,
+        _execution: Option<JobExecutionConfig>,
     },
     #[serde(rename = "run_test")]
     RunTest {
@@ -146,7 +146,7 @@ enum JobSource {
     #[serde(rename = "workspace_archive")]
     WorkspaceArchive {
         #[serde(rename = "archiveId", default)]
-        archive_id: Option<String>,
+        _archive_id: Option<String>,
         #[serde(default)]
         subdir: Option<String>,
     },
@@ -766,7 +766,6 @@ async fn prepare_job_workdir(
             }
 
             Ok(PreparedWorkspace {
-                host_path: checkout_root,
                 workdir,
             })
         }
@@ -787,7 +786,6 @@ async fn prepare_job_workdir(
             }
 
             Ok(PreparedWorkspace {
-                host_path: workspace_root,
                 workdir,
             })
         }
@@ -988,6 +986,25 @@ fn hash_key(value: &str) -> String {
 }
 
 async fn request_update() -> Result<()> {
+    let mut runner = RealUpdateCommandRunner;
+    request_update_with(&mut runner).await
+}
+
+#[async_trait::async_trait]
+trait UpdateCommandRunner: Send {
+    async fn output(&mut self, program: &str, args: &[&str]) -> std::io::Result<std::process::Output>;
+}
+
+struct RealUpdateCommandRunner;
+
+#[async_trait::async_trait]
+impl UpdateCommandRunner for RealUpdateCommandRunner {
+    async fn output(&mut self, program: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+        TokioCommand::new(program).args(args).output().await
+    }
+}
+
+async fn request_update_with(runner: &mut dyn UpdateCommandRunner) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
         bail!("agent update requests are supported on Linux only");
@@ -999,12 +1016,7 @@ async fn request_update() -> Result<()> {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "statix-agent-update.service".to_owned());
-        let output = match TokioCommand::new("systemctl")
-            .arg("start")
-            .arg(&service)
-            .output()
-            .await
-        {
+        let output = match runner.output("systemctl", &["start", service.as_str()]).await {
             Ok(output) if output.status.success() => output,
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
@@ -1012,12 +1024,8 @@ async fn request_update() -> Result<()> {
                     || stderr.contains("access denied")
                     || stderr.contains("permission denied")
                 {
-                    TokioCommand::new("sudo")
-                        .arg("-n")
-                        .arg("systemctl")
-                        .arg("start")
-                        .arg(&service)
-                        .output()
+                    runner
+                        .output("sudo", &["-n", "systemctl", "start", service.as_str()])
                         .await
                         .context("failed to start update service via sudo")?
                 } else {
@@ -1025,12 +1033,8 @@ async fn request_update() -> Result<()> {
                 }
             }
             Err(error) => {
-                TokioCommand::new("sudo")
-                    .arg("-n")
-                    .arg("systemctl")
-                    .arg("start")
-                    .arg(&service)
-                    .output()
+                runner
+                    .output("sudo", &["-n", "systemctl", "start", service.as_str()])
                     .await
                     .with_context(|| format!("failed to start update service: {error}"))?
             }
@@ -1045,6 +1049,68 @@ async fn request_update() -> Result<()> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, os::unix::process::ExitStatusExt, process::Output};
+
+    use super::*;
+
+    struct FakeUpdateCommandRunner {
+        calls: Vec<(String, Vec<String>)>,
+        responses: VecDeque<std::io::Result<Output>>,
+    }
+
+    impl FakeUpdateCommandRunner {
+        fn new(responses: Vec<std::io::Result<Output>>) -> Self {
+            Self { calls: Vec::new(), responses: responses.into(), }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UpdateCommandRunner for FakeUpdateCommandRunner {
+        async fn output(&mut self, program: &str, args: &[&str]) -> std::io::Result<Output> {
+            self.calls.push((program.to_string(), args.iter().map(|value| (*value).to_string()).collect()));
+            self.responses.pop_front().unwrap_or_else(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected update command invocation",
+                ))
+            })
+        }
+    }
+
+    fn success_output() -> Output {
+        Output {
+            status: ExitStatusExt::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn permission_denied_output() -> Output {
+        Output {
+            status: ExitStatusExt::from_raw(1),
+            stdout: Vec::new(),
+            stderr: b"Permission denied".to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_update_falls_back_to_sudo_when_systemctl_is_denied() {
+        let mut runner = FakeUpdateCommandRunner::new(vec![
+            Ok(permission_denied_output()),
+            Ok(success_output()),
+        ]);
+
+        request_update_with(&mut runner).await.unwrap();
+
+        assert_eq!(runner.calls, vec![
+            ("systemctl".to_string(), vec!["start".to_string(), "statix-agent-update.service".to_string()]),
+            ("sudo".to_string(), vec!["-n".to_string(), "systemctl".to_string(), "start".to_string(), "statix-agent-update.service".to_string()]),
+        ]);
     }
 }
 

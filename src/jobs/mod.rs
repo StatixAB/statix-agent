@@ -28,7 +28,6 @@ pub struct ExecutionContext {
 
 #[derive(Debug, Clone)]
 pub struct PreparedWorkspace {
-    pub host_path: PathBuf,
     pub workdir: PathBuf,
 }
 
