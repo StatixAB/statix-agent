@@ -9,6 +9,7 @@ Type=simple
 Environment=STATIX_AGENT_CONFIG=/etc/statix/agent.json
 Environment=STATIX_VERSION_FILE=/opt/statix/version.json
 Environment=STATIX_APPLY_WIREGUARD=0
+Environment=XDG_RUNTIME_DIR=/run/statix-agent
 EnvironmentFile=-/etc/statix/agent.env
 ExecStart=/usr/local/bin/statix run
 Restart=always
@@ -19,25 +20,38 @@ TimeoutStopSec=20s
 User=statix-agent
 Group=statix-agent
 
-# Run the main agent unprivileged; privileged actions should be delegated to narrow helpers.
-NoNewPrivileges=true
+# LXC jobs run as unprivileged containers, but LXC still needs namespace
+# creation, writable delegated cgroups, and the setuid uidmap helpers for the
+# configured subordinate IDs.
+NoNewPrivileges=false
+Delegate=yes
 PrivateTmp=true
-PrivateDevices=true
+PrivateDevices=false
 ProtectHome=read-only
 ProtectSystem=strict
-ProtectControlGroups=true
-ProtectKernelTunables=true
+# Ubuntu's LXC package uses this multiarch package directory as a temporary
+# rootfs mountpoint while starting containers. Keep it writable even though the
+# rest of /usr is read-only in the service mount namespace.
+ReadWritePaths=-/usr/lib/x86_64-linux-gnu/lxc/rootfs -/usr/lib/aarch64-linux-gnu/lxc/rootfs
+# lxc-user-nic serializes unprivileged veth allocation with /run/lxc/nics.
+ReadWritePaths=/run/lxc
+ProtectControlGroups=false
+# LXC must mount procfs/sysfs for job containers. Making kernel tunables
+# read-only in the agent's own mount namespace can make the container's procfs
+# mount look less restrictive and fail with EPERM.
+ProtectKernelTunables=false
 ProtectKernelModules=true
 ProtectClock=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-RestrictSUIDSGID=true
+RestrictSUIDSGID=false
 RestrictRealtime=true
-RestrictNamespaces=true
+RestrictNamespaces=false
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 ReadOnlyPaths=/etc/statix /opt/statix
 RuntimeDirectory=statix-agent
+RuntimeDirectoryMode=0700
 StateDirectory=statix-agent
 
 [Install]

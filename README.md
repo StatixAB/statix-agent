@@ -1,6 +1,6 @@
 # statix-agent
 
-Host-side Statix agent repository.
+Project layout:
 
 This repo contains:
 - the Rust `statix` agent binary

@@ -1,8 +1,4 @@
-use std::{
-    env, fs,
-    path::PathBuf,
-    sync::OnceLock,
-};
+use std::{env, fs, path::PathBuf, sync::OnceLock};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -10,7 +6,10 @@ use sha2::{Digest, Sha256};
 use sysinfo::System;
 use tokio::{process::Command, time::timeout};
 
-use crate::{config::WireGuardConfig, wireguard::{WireGuardStatus, collect_status as collect_wireguard_status}};
+use crate::{
+    config::WireGuardConfig,
+    wireguard::{WireGuardStatus, collect_status as collect_wireguard_status},
+};
 
 #[derive(Debug, Serialize)]
 pub struct SystemInfoPayload {
@@ -109,7 +108,9 @@ pub fn collect_mac_addresses() -> Vec<String> {
     }
 }
 
-pub async fn collect_system_info(wireguard_config: Option<&WireGuardConfig>) -> Result<SystemInfoPayload> {
+pub async fn collect_system_info(
+    wireguard_config: Option<&WireGuardConfig>,
+) -> Result<SystemInfoPayload> {
     let mut system = System::new_all();
     system.refresh_memory();
     system.refresh_cpu_all();
@@ -129,8 +130,12 @@ pub async fn collect_system_info(wireguard_config: Option<&WireGuardConfig>) -> 
         cpu_cores: cpus.len().max(1) as u32,
         mem_total: system.total_memory().max(1),
         agent_version: version_metadata.as_ref().map(|value| value.version.clone()),
-        agent_commit: version_metadata.as_ref().and_then(|value| value.commit.clone()),
-        agent_built_at: version_metadata.as_ref().and_then(|value| value.built_at.clone()),
+        agent_commit: version_metadata
+            .as_ref()
+            .and_then(|value| value.commit.clone()),
+        agent_built_at: version_metadata
+            .as_ref()
+            .and_then(|value| value.built_at.clone()),
         wireguard: collect_wireguard_status(wireguard_config).await,
         gpus: collect_gpu_info().await,
     };
@@ -227,7 +232,10 @@ async fn collect_gpu_info() -> Vec<GpuInfo> {
 async fn try_collect_nvidia_smi_gpus() -> Option<Vec<GpuInfo>> {
     let output = run_command_with_timeout(
         "nvidia-smi",
-        &["--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"],
+        &[
+            "--query-gpu=name,memory.total,driver_version",
+            "--format=csv,noheader,nounits",
+        ],
     )
     .await?;
 
@@ -256,11 +264,7 @@ async fn try_collect_nvidia_smi_gpus() -> Option<Vec<GpuInfo>> {
         })
         .collect();
 
-    if gpus.is_empty() {
-        None
-    } else {
-        Some(gpus)
-    }
+    if gpus.is_empty() { None } else { Some(gpus) }
 }
 
 async fn try_collect_linux_pci_gpus() -> Option<Vec<GpuInfo>> {
@@ -306,11 +310,7 @@ async fn try_collect_linux_pci_gpus() -> Option<Vec<GpuInfo>> {
         })
         .collect();
 
-    if gpus.is_empty() {
-        None
-    } else {
-        Some(gpus)
-    }
+    if gpus.is_empty() { None } else { Some(gpus) }
 }
 
 async fn run_command_with_timeout(program: &str, args: &[&str]) -> Option<String> {

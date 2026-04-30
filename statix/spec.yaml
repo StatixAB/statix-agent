@@ -1,0 +1,72 @@
+apiVersion: statix/v2
+kind: ProjectSpec
+
+metadata:
+  name: statix-agent
+  slug: statix-agent
+  owners:
+    - statix
+  labels:
+    language: rust
+    component: agent
+
+defaults:
+  runtime: container
+  shell: bash
+  timeoutSeconds: 1800
+  retryLimit: 0
+  environment:
+    CARGO_TERM_COLOR: always
+
+resources:
+  default:
+    executor: container
+    profile: standard
+
+setups:
+  rust-toolchain:
+    description: Install a current stable Rust toolchain for edition 2024 builds.
+    run:
+      - bash
+      - -lc
+      - apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl build-essential git libssl-dev pkg-config && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+    cacheKey: rustup-stable-v1
+  cargo-deps:
+    description: Prepare the Rust dependency graph for test runs.
+    run:
+      - bash
+      - -lc
+      - . "$HOME/.cargo/env" && cargo fetch
+    cacheKey: cargo-lock-v1
+
+tasks:
+  test:
+    executor: container
+    execution:
+      environment:
+        type: container
+        image: ubuntu:24.04
+    command:
+      - bash
+      - -lc
+      - . "$HOME/.cargo/env" && cargo test
+    setup:
+      - rust-toolchain
+      - cargo-deps
+    inputs:
+      sources:
+        - kind: workspace_path
+          path: .
+    constraints:
+      timeoutSeconds: 1800
+      resourceClass: default
+
+workflows:
+  ci:
+    - task: test
+
+deployments: {}
+
+policies:
+  concurrency:
+    mode: allow

@@ -1,0 +1,3 @@
+policies:
+  concurrency:
+    mode: allow

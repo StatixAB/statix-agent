@@ -1,0 +1,21 @@
+name: test
+task:
+  executor: container
+  execution:
+    environment:
+      type: container
+      image: ubuntu:24.04
+  command:
+    - bash
+    - -lc
+    - . "$HOME/.cargo/env" && cargo test
+  setup:
+    - rust-toolchain
+    - cargo-deps
+  inputs:
+    sources:
+      - kind: workspace_path
+        path: .
+  constraints:
+    timeoutSeconds: 1800
+    resourceClass: default
