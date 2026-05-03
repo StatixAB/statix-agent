@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_API_BASE_URL: &str = "https://statix.se";
+const DEFAULT_API_BASE_URL: &str = "https://statix.se/api";
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -103,7 +103,7 @@ impl AgentConfig {
                     .filter(|value| !value.is_empty())
                     .map(|value| {
                         let ws_path =
-                            env::var("NODE_WS_PATH").unwrap_or_else(|_| "/ws/agent".to_owned());
+                            env::var("NODE_WS_PATH").unwrap_or_else(|_| "/api/ws/agent".to_owned());
                         format!(
                             "{}{}",
                             to_ws_base_url(&trim_trailing_slash(&value)),
@@ -436,7 +436,7 @@ fn normalize_api_base_url(value: &str) -> String {
         return String::new();
     }
 
-    let Some(hostname) = extract_hostname(&trimmed) else {
+    let Some(_hostname) = extract_hostname(&trimmed) else {
         return trimmed;
     };
 
@@ -449,8 +449,8 @@ fn normalize_api_base_url(value: &str) -> String {
         .map(|index| &without_scheme[index..])
         .unwrap_or("");
 
-    if (hostname == "statix.se" || hostname.ends_with(".statix.se")) && path == "/api" {
-        return trimmed.trim_end_matches("/api").to_owned();
+    if path.is_empty() {
+        return format!("{trimmed}/api");
     }
 
     trimmed
@@ -543,11 +543,14 @@ fn api_base_url_from_ws_url(value: &str) -> String {
         value.to_owned()
     };
 
-    if let Some(stripped) = base.strip_suffix("/ws/agent") {
+    if let Some(stripped) = base.strip_suffix("/api/ws/agent") {
         return stripped.to_owned();
     }
+    if let Some(stripped) = base.strip_suffix("/ws/agent") {
+        return normalize_api_base_url(stripped);
+    }
 
-    trim_trailing_slash(&base)
+    normalize_api_base_url(&base)
 }
 
 #[cfg(test)]
@@ -577,7 +580,7 @@ mod tests {
             Some("http://env:3001/".to_owned()),
             Some("http://persisted:3001".to_owned()),
         );
-        assert_eq!(api_base_url, "http://env:3001");
+        assert_eq!(api_base_url, "http://env:3001/api");
     }
 
     #[test]
@@ -597,32 +600,32 @@ mod tests {
             None,
             Some("https://selfhosted.example.com/".to_owned()),
         );
-        assert_eq!(api_base_url, "https://selfhosted.example.com");
+        assert_eq!(api_base_url, "https://selfhosted.example.com/api");
     }
 
     #[test]
-    fn resolve_login_config_keeps_hosted_root_url() {
+    fn resolve_login_config_scopes_hosted_root_url_to_api() {
         let api_base_url =
             resolve_login_api_base_url(Some("https://statix.se".to_owned()), None, None);
-        assert_eq!(api_base_url, "https://statix.se");
+        assert_eq!(api_base_url, "https://statix.se/api");
     }
 
     #[test]
-    fn normalize_api_base_url_keeps_hosted_subdomain_root_url() {
+    fn normalize_api_base_url_scopes_hosted_subdomain_root_url_to_api() {
         let api_base_url = normalize_api_base_url("https://dev.statix.se/");
-        assert_eq!(api_base_url, "https://dev.statix.se");
+        assert_eq!(api_base_url, "https://dev.statix.se/api");
     }
 
     #[test]
-    fn normalize_api_base_url_strips_legacy_api_path_for_hosted_urls() {
+    fn normalize_api_base_url_keeps_api_path() {
         let api_base_url = normalize_api_base_url("https://dev.statix.se/api/");
-        assert_eq!(api_base_url, "https://dev.statix.se");
+        assert_eq!(api_base_url, "https://dev.statix.se/api");
     }
 
     #[test]
-    fn resolve_login_config_keeps_local_root_url() {
+    fn resolve_login_config_scopes_local_root_url_to_api() {
         let api_base_url =
             resolve_login_api_base_url(Some("http://localhost:3001/".to_owned()), None, None);
-        assert_eq!(api_base_url, "http://localhost:3001");
+        assert_eq!(api_base_url, "http://localhost:3001/api");
     }
 }

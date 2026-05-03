@@ -164,13 +164,6 @@ enum JobSource {
         #[serde(default)]
         subdir: Option<String>,
     },
-    #[serde(rename = "workspace_archive")]
-    WorkspaceArchive {
-        #[serde(rename = "archiveId", default)]
-        _archive_id: Option<String>,
-        #[serde(default)]
-        subdir: Option<String>,
-    },
 }
 
 enum SessionOutcome {
@@ -720,7 +713,7 @@ async fn execute_job(
                 bail!("unsupported test preset: {preset}");
             }
 
-            let workspace = prepare_job_workdir(config, &job.id, source).await?;
+            let workspace = prepare_job_workdir(&job.id, source).await?;
             let execution = execution.clone().unwrap_or(JobExecutionConfig {
                 job_id: None,
                 attempt_id: None,
@@ -814,11 +807,7 @@ fn shell_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-async fn prepare_job_workdir(
-    config: &AgentConfig,
-    job_id: &str,
-    source: &JobSource,
-) -> Result<PreparedWorkspace> {
+async fn prepare_job_workdir(job_id: &str, source: &JobSource) -> Result<PreparedWorkspace> {
     log_verbose(&format!("preparing workdir for job {job_id}"));
     match source {
         JobSource::GitCheckout {
@@ -838,24 +827,6 @@ async fn prepare_job_workdir(
             {
                 Some(value) => checkout_root.join(value),
                 None => checkout_root.clone(),
-            };
-
-            if !workdir.is_dir() {
-                bail!("resolved workdir does not exist: {}", workdir.display());
-            }
-
-            Ok(PreparedWorkspace { workdir })
-        }
-        JobSource::WorkspaceArchive { subdir, .. } => {
-            log_verbose(&format!("job {job_id}: materializing workspace archive"));
-            let workspace_root = materialize_workspace_archive(config, job_id).await?;
-            let workdir = match subdir
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                Some(value) => workspace_root.join(value),
-                None => workspace_root.clone(),
             };
 
             if !workdir.is_dir() {
@@ -924,60 +895,6 @@ async fn materialize_git_checkout(
     Ok(repo_dir)
 }
 
-async fn materialize_workspace_archive(config: &AgentConfig, job_id: &str) -> Result<PathBuf> {
-    let job_root = agent_state_dir()?.join("jobs").join("runs").join(job_id);
-    let workspace_root = job_root.join("workspace");
-    let archive_path = job_root.join("source.tar.gz");
-    std::fs::create_dir_all(&job_root)
-        .with_context(|| format!("failed to create {}", job_root.display()))?;
-    if workspace_root.exists() {
-        std::fs::remove_dir_all(&workspace_root)
-            .with_context(|| format!("failed to reset {}", workspace_root.display()))?;
-    }
-    std::fs::create_dir_all(&workspace_root)
-        .with_context(|| format!("failed to create {}", workspace_root.display()))?;
-
-    let archive_bytes = download_job_source_archive(config, job_id).await?;
-    std::fs::write(&archive_path, archive_bytes)
-        .with_context(|| format!("failed to write {}", archive_path.display()))?;
-
-    extract_archive(&archive_path, &workspace_root).await?;
-    Ok(workspace_root)
-}
-
-async fn download_job_source_archive(config: &AgentConfig, job_id: &str) -> Result<Vec<u8>> {
-    let client = reqwest::Client::new();
-    let archive_url = format!("{}/jobs/{job_id}/source", config.api_base_url);
-    log_verbose(&format!("downloading source archive from {archive_url}"));
-    let response = client
-        .get(&archive_url)
-        .header("x-statix-node-id", &config.node_id)
-        .header("x-statix-node-token", &config.node_token)
-        .send()
-        .await
-        .with_context(|| format!("failed to request source archive for job {job_id}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "request failed".to_string());
-        bail!(
-            "source archive download failed ({}): {}",
-            status.as_u16(),
-            body
-        );
-    }
-
-    let bytes = response.bytes().await?.to_vec();
-    log_verbose(&format!(
-        "downloaded source archive for job {job_id} ({} bytes)",
-        bytes.len()
-    ));
-    Ok(bytes)
-}
-
 fn verbose_logs_enabled() -> bool {
     env_flag("STATIX_VERBOSE_LOGS")
 }
@@ -996,34 +913,6 @@ fn truncate_for_log(value: &str, max_chars: usize) -> String {
     let mut shortened = value.chars().take(max_chars).collect::<String>();
     shortened.push_str("...");
     shortened
-}
-
-async fn extract_archive(
-    archive_path: &std::path::Path,
-    destination: &std::path::Path,
-) -> Result<()> {
-    let output = TokioCommand::new("tar")
-        .arg("-xzf")
-        .arg(archive_path)
-        .arg("-C")
-        .arg(destination)
-        .output()
-        .await
-        .with_context(|| format!("failed to extract {}", archive_path.display()))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        bail!(
-            "tar extraction failed: {}",
-            if stderr.is_empty() {
-                "unknown error"
-            } else {
-                &stderr
-            }
-        );
-    }
-
-    Ok(())
 }
 
 async fn run_git(args: &[&str], cwd: Option<&std::path::Path>) -> Result<()> {
