@@ -254,8 +254,8 @@ fn format_error_chain(error: &anyhow::Error) -> String {
 }
 
 async fn run_agent() -> Result<()> {
-    let config = AgentConfig::load().context(
-        "Agent identity not configured. Run `statix login --api-base-url http://host:3001` or set NODE_ID/NODE_TOKEN in the environment.",
+    let config = AgentConfig::load()?.context(
+        "Agent identity not configured. Run `statix-agent login --api-base-url http://host:3001` with STATIX_AGENT_CONFIG pointing at the service config, or set NODE_ID/NODE_TOKEN in the environment.",
     )?;
     eprintln!("[statix-agent] starting with nodeId: {}", config.node_id);
     log_verbose(&format!(

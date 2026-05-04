@@ -79,19 +79,25 @@ pub struct WireGuardPeerConfig {
 }
 
 impl AgentConfig {
-    pub fn load() -> Option<Self> {
-        let persisted = load_persisted_config().ok().flatten();
+    pub fn load() -> Result<Option<Self>> {
+        let persisted = load_persisted_config()?;
 
         let node_id = env::var("NODE_ID")
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
-            .or_else(|| persisted.as_ref().map(|value| value.node_id.clone()))?;
+            .or_else(|| persisted.as_ref().map(|value| value.node_id.clone()));
+        let Some(node_id) = node_id else {
+            return Ok(None);
+        };
         let node_token = env::var("NODE_TOKEN")
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
-            .or_else(|| persisted.as_ref().map(|value| value.node_token.clone()))?;
+            .or_else(|| persisted.as_ref().map(|value| value.node_token.clone()));
+        let Some(node_token) = node_token else {
+            return Ok(None);
+        };
         let agent_ws_url = env::var("AGENT_WS_URL")
             .ok()
             .map(|value| value.trim().to_owned())
@@ -111,7 +117,10 @@ impl AgentConfig {
                         )
                     })
             })
-            .or_else(|| persisted.as_ref().map(|value| value.agent_ws_url.clone()))?;
+            .or_else(|| persisted.as_ref().map(|value| value.agent_ws_url.clone()));
+        let Some(agent_ws_url) = agent_ws_url else {
+            return Ok(None);
+        };
         let api_base_url = normalize_api_base_url(
             &env::var("API_BASE_URL")
                 .ok()
@@ -125,7 +134,7 @@ impl AgentConfig {
                 .unwrap_or_else(|| api_base_url_from_ws_url(&agent_ws_url)),
         );
 
-        Some(Self {
+        Ok(Some(Self {
             node_id,
             node_token,
             agent_ws_url,
@@ -156,7 +165,7 @@ impl AgentConfig {
                 .unwrap_or_else(|| "ubuntu-24.04".to_string()),
             microvm_default_cpu: parse_positive_u8("STATIX_MICROVM_CPU", 2),
             microvm_default_memory_mb: parse_positive_u32("STATIX_MICROVM_MEMORY_MB", 4096),
-        })
+        }))
     }
 }
 
