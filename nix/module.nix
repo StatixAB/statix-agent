@@ -161,6 +161,8 @@ in
       "d ${lxcHome}/.local 0750 ${cfg.user} ${cfg.group} - -"
       "d ${lxcHome}/.local/share 0750 ${cfg.user} ${cfg.group} - -"
       "d ${lxcConfigDir} 0750 ${cfg.user} ${cfg.group} - -"
+      "d /run/lxc 0755 root root - -"
+      "d /run/lxc/nics 0755 root root - -"
     ];
 
     systemd.services.statix-agent = {
@@ -190,7 +192,7 @@ in
         WorkingDirectory = cfg.stateDir;
         RuntimeDirectory = "statix-agent";
         RuntimeDirectoryMode = "0700";
-        ReadWritePaths = [ cfg.stateDir ] ++ lib.optional cfg.lxc.enable "/run/lxc";
+        ReadWritePaths = [ cfg.stateDir ] ++ lib.optional cfg.lxc.enable "-/run/lxc";
         NoNewPrivileges = false;
         Delegate = lib.mkIf cfg.lxc.enable true;
         PrivateTmp = true;
