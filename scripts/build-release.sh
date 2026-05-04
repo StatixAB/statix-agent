@@ -9,7 +9,7 @@ LINUX_ROOT="${RELEASE_ROOT}/linux"
 UBUNTU_INSTALLER_ROOT="${RELEASE_ROOT}/installers/ubuntu/24.04"
 ARCH_INSTALLER_ROOT="${RELEASE_ROOT}/installers/archlinux"
 METADATA_ROOT="${RELEASE_ROOT}/metadata"
-BINARY_NAME="statix"
+BINARY_NAME="statix-agent"
 
 log() {
   printf '[build-release] %s\n' "$*"

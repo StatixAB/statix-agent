@@ -5,7 +5,7 @@ readonly SERVICE_NAME="statix-agent"
 readonly DEFAULT_DOWNLOAD_BASE_URL="https://github.com/statixab/statix-agent/releases/latest/download"
 
 DOWNLOAD_BASE_URL="${STATIX_DOWNLOAD_BASE_URL:-$DEFAULT_DOWNLOAD_BASE_URL}"
-BINARY_PATH="${STATIX_BINARY_PATH:-/usr/local/bin/statix}"
+BINARY_PATH="${STATIX_BINARY_PATH:-/usr/local/bin/statix-agent}"
 VERSION_FILE="${STATIX_VERSION_FILE:-/opt/statix/version.json}"
 SERVICE_PATH="${STATIX_SERVICE_PATH:-/etc/systemd/system/$SERVICE_NAME.service}"
 

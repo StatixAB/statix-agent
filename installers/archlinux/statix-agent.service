@@ -10,7 +10,7 @@ Environment=STATIX_AGENT_CONFIG=/etc/statix/agent.json
 Environment=STATIX_VERSION_FILE=/opt/statix/version.json
 Environment=STATIX_APPLY_WIREGUARD=0
 EnvironmentFile=-/etc/statix/agent.env
-ExecStart=/usr/local/bin/statix run
+ExecStart=/usr/local/bin/statix-agent run
 Restart=always
 RestartSec=5s
 KillSignal=SIGINT

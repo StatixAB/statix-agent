@@ -190,7 +190,7 @@ struct CompletedJobStatus {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "statix")]
+#[command(name = "statix-agent")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

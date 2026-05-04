@@ -33,6 +33,6 @@ rustPlatform.buildRustPackage {
     description = "Statix node agent";
     homepage = "https://statix.se";
     license = lib.licenses.asl20;
-    mainProgram = "statix";
+    mainProgram = "statix-agent";
   };
 }

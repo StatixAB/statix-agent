@@ -20,7 +20,7 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=build /repo/target/release/statix /app/statix
+COPY --from=build /repo/target/release/statix-agent /app/statix-agent
 COPY --from=build /repo/version.json /app/version.json
 
-CMD ["/app/statix"]
+CMD ["/app/statix-agent"]
