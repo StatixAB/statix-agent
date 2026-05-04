@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_API_BASE_URL: &str = "https://statix.se/api";
@@ -80,6 +80,8 @@ pub struct WireGuardPeerConfig {
 
 impl AgentConfig {
     pub fn load() -> Result<Option<Self>> {
+        let persisted_path = persisted_config_path()?;
+        let persisted_exists = persisted_path.exists();
         let persisted = load_persisted_config()?;
 
         let node_id = env::var("NODE_ID")
@@ -88,6 +90,12 @@ impl AgentConfig {
             .filter(|value| !value.is_empty())
             .or_else(|| persisted.as_ref().map(|value| value.node_id.clone()));
         let Some(node_id) = node_id else {
+            if persisted_exists {
+                bail!(
+                    "Agent identity field `node_id` was not found in {} and NODE_ID is not set.",
+                    persisted_path.display()
+                );
+            }
             return Ok(None);
         };
         let node_token = env::var("NODE_TOKEN")
@@ -96,6 +104,12 @@ impl AgentConfig {
             .filter(|value| !value.is_empty())
             .or_else(|| persisted.as_ref().map(|value| value.node_token.clone()));
         let Some(node_token) = node_token else {
+            if persisted_exists {
+                bail!(
+                    "Agent identity field `node_token` was not found in {} and NODE_TOKEN is not set.",
+                    persisted_path.display()
+                );
+            }
             return Ok(None);
         };
         let agent_ws_url = env::var("AGENT_WS_URL")
@@ -119,6 +133,12 @@ impl AgentConfig {
             })
             .or_else(|| persisted.as_ref().map(|value| value.agent_ws_url.clone()));
         let Some(agent_ws_url) = agent_ws_url else {
+            if persisted_exists {
+                bail!(
+                    "Agent identity field `agent_ws_url` was not found in {} and AGENT_WS_URL/API_BASE_URL are not set.",
+                    persisted_path.display()
+                );
+            }
             return Ok(None);
         };
         let api_base_url = normalize_api_base_url(
