@@ -13,6 +13,27 @@ let
   lxcHome = "${cfg.stateDir}/lxc";
   lxcConfigDir = "${lxcHome}/.config/lxc";
   lxcConfigFile = "${lxcConfigDir}/default.conf";
+  lxcPreStartScript = pkgs.writeShellScript "statix-agent-lxc-pre-start" ''
+    set -euo pipefail
+
+    install -d -m 0711 -o ${cfg.user} -g ${cfg.group} ${cfg.stateDir} ${lxcHome} ${lxcHome}/containers
+    install -d -m 0750 -o ${cfg.user} -g ${cfg.group} ${lxcHome}/.cache ${lxcHome}/.local ${lxcHome}/.local/share ${lxcHome}/.config ${lxcConfigDir}
+    install -d -m 0755 /run/lxc /run/lxc/nics
+    {
+      if [ -r /etc/lxc/default.conf ]; then
+        printf 'lxc.include = /etc/lxc/default.conf\n'
+      else
+        printf 'lxc.net.0.type = veth\n'
+        printf 'lxc.net.0.link = ${cfg.lxc.bridge}\n'
+        printf 'lxc.net.0.flags = up\n'
+      fi
+      printf 'lxc.idmap = u 0 %s %s\n' ${toString cfg.lxc.subIdStart} ${toString cfg.lxc.subIdCount}
+      printf 'lxc.idmap = g 0 %s %s\n' ${toString cfg.lxc.subIdStart} ${toString cfg.lxc.subIdCount}
+      printf 'lxc.apparmor.profile = unconfined\n'
+    } > ${lxcConfigFile}
+    chown ${cfg.user}:${cfg.group} ${lxcConfigFile}
+    chmod 0640 ${lxcConfigFile}
+  '';
 in
 {
   options.services.statix-agent = {
@@ -160,6 +181,7 @@ in
       "d ${lxcHome}/.cache 0750 ${cfg.user} ${cfg.group} - -"
       "d ${lxcHome}/.local 0750 ${cfg.user} ${cfg.group} - -"
       "d ${lxcHome}/.local/share 0750 ${cfg.user} ${cfg.group} - -"
+      "d ${lxcHome}/.config 0750 ${cfg.user} ${cfg.group} - -"
       "d ${lxcConfigDir} 0750 ${cfg.user} ${cfg.group} - -"
       "d /run/lxc 0755 root root - -"
       "d /run/lxc/nics 0755 root root - -"
@@ -204,26 +226,10 @@ in
         ProtectKernelModules = true;
         RestrictSUIDSGID = lib.mkIf cfg.lxc.enable false;
         RestrictNamespaces = lib.mkIf cfg.lxc.enable false;
+      }
+      // lib.optionalAttrs cfg.lxc.enable {
+        ExecStartPre = "+${lxcPreStartScript}";
       };
-
-      preStart = lib.mkIf cfg.lxc.enable ''
-        install -d -m 0711 -o ${cfg.user} -g ${cfg.group} ${cfg.stateDir} ${lxcHome} ${lxcHome}/containers
-        install -d -m 0750 -o ${cfg.user} -g ${cfg.group} ${lxcHome}/.cache ${lxcHome}/.local ${lxcHome}/.local/share ${lxcConfigDir}
-        {
-          if [ -r /etc/lxc/default.conf ]; then
-            printf 'lxc.include = /etc/lxc/default.conf\n'
-          else
-            printf 'lxc.net.0.type = veth\n'
-            printf 'lxc.net.0.link = ${cfg.lxc.bridge}\n'
-            printf 'lxc.net.0.flags = up\n'
-          fi
-          printf 'lxc.idmap = u 0 %s %s\n' ${toString cfg.lxc.subIdStart} ${toString cfg.lxc.subIdCount}
-          printf 'lxc.idmap = g 0 %s %s\n' ${toString cfg.lxc.subIdStart} ${toString cfg.lxc.subIdCount}
-          printf 'lxc.apparmor.profile = unconfined\n'
-        } > ${lxcConfigFile}
-        chown ${cfg.user}:${cfg.group} ${lxcConfigFile}
-        chmod 0640 ${lxcConfigFile}
-      '';
     };
   };
 }
