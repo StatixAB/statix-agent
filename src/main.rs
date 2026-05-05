@@ -6,10 +6,12 @@ mod system_info;
 mod wireguard;
 
 use std::{
+    collections::BTreeMap,
     collections::VecDeque,
     collections::hash_map::DefaultHasher,
+    fs,
     hash::{Hash, Hasher},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -19,6 +21,7 @@ use config::{AgentConfig, WireGuardConfig, agent_state_dir, resolve_login_config
 use enrollment::{LoginOptions, run_login};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     process::Command as TokioCommand,
     select, signal,
@@ -148,6 +151,29 @@ enum AgentJobSpec {
         #[serde(default)]
         execution: Option<JobExecutionConfig>,
     },
+    #[serde(rename = "deploy_bundle")]
+    DeployBundle {
+        #[serde(rename = "deploymentId")]
+        deployment_id: String,
+        #[serde(rename = "bundleId")]
+        _bundle_id: String,
+        #[serde(rename = "projectId")]
+        _project_id: String,
+        environment: String,
+        #[serde(rename = "dryRun", default)]
+        dry_run: bool,
+        bundle: DeploymentBundle,
+        #[serde(default)]
+        setup: Vec<DeploymentSetup>,
+        #[serde(default)]
+        command: Vec<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        #[serde(rename = "timeoutSeconds", default)]
+        timeout_seconds: Option<u64>,
+        #[serde(default)]
+        execution: Option<JobExecutionConfig>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +190,25 @@ enum JobSource {
         #[serde(default)]
         subdir: Option<String>,
     },
+}
+
+#[derive(Debug, Deserialize)]
+struct DeploymentBundle {
+    #[serde(rename = "downloadSessionUrl")]
+    download_session_url: String,
+    sha256: String,
+    #[serde(rename = "sizeBytes")]
+    size_bytes: u64,
+    #[serde(rename = "objectKey")]
+    _object_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeploymentSetup {
+    name: String,
+    run: Vec<String>,
+    #[serde(default)]
+    exports: BTreeMap<String, String>,
 }
 
 enum SessionOutcome {
@@ -759,7 +804,147 @@ async fn execute_job(
             )
             .await
         }
+        AgentJobSpec::DeployBundle {
+            deployment_id,
+            environment,
+            dry_run,
+            bundle,
+            setup,
+            command,
+            env,
+            timeout_seconds,
+            execution,
+            ..
+        } => {
+            let workspace = prepare_deployment_workdir(config, job, bundle).await?;
+            let execution = execution.clone().unwrap_or(JobExecutionConfig {
+                job_id: None,
+                attempt_id: None,
+                environment: None,
+            });
+            let runner_environment = match execution.environment.unwrap_or(JobEnvironment::Host) {
+                JobEnvironment::Host => RunnerEnvironment::Host,
+                JobEnvironment::Container {
+                    image,
+                    cpu,
+                    memory_mb,
+                } => RunnerEnvironment::Container {
+                    image: image.unwrap_or_else(|| config.container_default_image.clone()),
+                    cpu: cpu.or(Some(config.container_default_cpu)),
+                    memory_mb: memory_mb.or(Some(config.container_default_memory_mb)),
+                },
+                JobEnvironment::Microvm {
+                    image,
+                    cpu,
+                    memory_mb,
+                } => RunnerEnvironment::Microvm {
+                    image: image.unwrap_or_else(|| config.microvm_default_image.clone()),
+                    cpu: cpu.or(Some(config.microvm_default_cpu)),
+                    memory_mb: memory_mb.or(Some(config.microvm_default_memory_mb)),
+                },
+            };
+            let timeout_seconds = timeout_seconds.unwrap_or(1800);
+            let job_id = execution.job_id.unwrap_or_else(|| deployment_id.clone());
+            let attempt_id = execution.attempt_id.unwrap_or_else(|| job.id.clone());
+            let mut command_env = env.clone();
+            command_env.insert("STATIX_DEPLOYMENT_ID".to_string(), deployment_id.clone());
+            command_env.insert(
+                "STATIX_DEPLOYMENT_ENVIRONMENT".to_string(),
+                environment.clone(),
+            );
+
+            eprintln!(
+                "[statix-agent] job {}: executing deploy_bundle in {} environment",
+                job.id,
+                runner_environment_label(&runner_environment)
+            );
+
+            for setup_step in setup {
+                if setup_step.run.is_empty() {
+                    bail!(
+                        "deployment setup `{}` command must not be empty",
+                        setup_step.name
+                    );
+                }
+                let setup_command = env_command(&setup_step.run, &command_env);
+                jobs::execute(
+                    &runner_environment,
+                    &ExecutionContext {
+                        job_id: job_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        timeout_seconds,
+                        log_tx: Some(log_tx.clone()),
+                    },
+                    &workspace,
+                    &setup_command,
+                )
+                .await
+                .with_context(|| format!("deployment setup `{}` failed", setup_step.name))?;
+                command_env.extend(setup_step.exports.clone());
+            }
+
+            if *dry_run {
+                return Ok(jobs::JobExecutionResult {
+                    status: "succeeded",
+                    message: Some("deployment dry run completed".to_string()),
+                });
+            }
+
+            let command = if command.is_empty() {
+                vec![
+                    "bash".to_string(),
+                    "-lc".to_string(),
+                    "if [ -x ./statix/deploy.sh ]; then exec ./statix/deploy.sh; else echo 'deployment command is required' >&2; exit 2; fi".to_string(),
+                ]
+            } else {
+                command.clone()
+            };
+
+            jobs::execute(
+                &runner_environment,
+                &ExecutionContext {
+                    job_id,
+                    attempt_id,
+                    timeout_seconds,
+                    log_tx: Some(log_tx),
+                },
+                &workspace,
+                &env_command(&command, &command_env),
+            )
+            .await
+        }
     }
+}
+
+fn env_command(command: &[String], env: &BTreeMap<String, String>) -> Vec<String> {
+    if env.is_empty() {
+        return command.to_vec();
+    }
+
+    let mut exports = env
+        .iter()
+        .filter_map(|(key, value)| {
+            shell_env_key(key).map(|key| format!("export {}={};", key, shell_escape(value)))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    exports.push_str(" exec ");
+    exports.push_str(&shell_join(command));
+
+    vec!["bash".to_string(), "-lc".to_string(), exports]
+}
+
+fn shell_env_key(key: &str) -> Option<String> {
+    let key = key.trim();
+    let mut chars = key.chars();
+    let first = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !chars.all(|character| character == '_' || character.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(key.to_string())
 }
 
 fn runner_environment_label(environment: &RunnerEnvironment) -> &'static str {
@@ -836,6 +1021,136 @@ async fn prepare_job_workdir(job_id: &str, source: &JobSource) -> Result<Prepare
             Ok(PreparedWorkspace { workdir })
         }
     }
+}
+
+async fn prepare_deployment_workdir(
+    config: &AgentConfig,
+    job: &AgentJob,
+    bundle: &DeploymentBundle,
+) -> Result<PreparedWorkspace> {
+    log_verbose(&format!("preparing deployment workdir for job {}", job.id));
+    let root = agent_state_dir()?.join("jobs").join("deployments");
+    fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
+
+    let job_root = root.join(safe_path_segment(&job.id));
+    if job_root.exists() {
+        fs::remove_dir_all(&job_root)
+            .with_context(|| format!("failed to clean {}", job_root.display()))?;
+    }
+    fs::create_dir_all(&job_root)
+        .with_context(|| format!("failed to create {}", job_root.display()))?;
+
+    let archive_path = job_root.join("project.tar.zst");
+    let workdir = job_root.join("workspace");
+    fs::create_dir_all(&workdir)
+        .with_context(|| format!("failed to create {}", workdir.display()))?;
+
+    download_deployment_bundle(config, bundle, &archive_path).await?;
+    extract_deployment_bundle(&archive_path, &workdir).await?;
+
+    Ok(PreparedWorkspace { workdir })
+}
+
+async fn download_deployment_bundle(
+    config: &AgentConfig,
+    bundle: &DeploymentBundle,
+    archive_path: &Path,
+) -> Result<()> {
+    let url = deployment_api_url(&config.api_base_url, &bundle.download_session_url);
+    let session = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(&config.node_token)
+        .header("x-node-id", &config.node_id)
+        .send()
+        .await
+        .context("failed to request deployment bundle download session")?;
+    let status = session.status();
+    let body = session
+        .text()
+        .await
+        .context("failed to read deployment bundle download session")?;
+    if !status.is_success() {
+        bail!("deployment bundle download session failed ({status}): {body}");
+    }
+    let session: DeploymentDownloadSession =
+        serde_json::from_str(&body).context("invalid deployment bundle download session")?;
+
+    let bytes = reqwest::get(&session.url)
+        .await
+        .context("failed to download deployment bundle")?
+        .bytes()
+        .await
+        .context("failed to read deployment bundle")?;
+    if bytes.len() as u64 != bundle.size_bytes || bytes.len() as u64 != session.size_bytes {
+        bail!(
+            "deployment bundle size mismatch: downloaded {}, expected {}",
+            bytes.len(),
+            bundle.size_bytes
+        );
+    }
+
+    let digest = Sha256::digest(&bytes);
+    let actual_sha = hex::encode(digest);
+    if !actual_sha.eq_ignore_ascii_case(&bundle.sha256)
+        || !actual_sha.eq_ignore_ascii_case(&session.sha256)
+    {
+        bail!(
+            "deployment bundle sha256 mismatch: downloaded {}, expected {}",
+            actual_sha,
+            bundle.sha256
+        );
+    }
+
+    fs::write(archive_path, bytes)
+        .with_context(|| format!("failed to write {}", archive_path.display()))?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct DeploymentDownloadSession {
+    url: String,
+    sha256: String,
+    #[serde(rename = "sizeBytes")]
+    size_bytes: u64,
+}
+
+async fn extract_deployment_bundle(archive_path: &Path, workdir: &Path) -> Result<()> {
+    let status = TokioCommand::new("tar")
+        .arg("--zstd")
+        .arg("-xf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(workdir)
+        .status()
+        .await
+        .context("failed to launch tar")?;
+    if !status.success() {
+        bail!("tar failed to extract deployment bundle with status {status}");
+    }
+    Ok(())
+}
+
+fn deployment_api_url(api_base_url: &str, path: &str) -> String {
+    let base = api_base_url.trim_end_matches('/');
+    let path = if base.ends_with("/api") {
+        path.trim_start_matches("/api")
+    } else {
+        path
+    };
+    format!("{base}/{}", path.trim_start_matches('/'))
+}
+
+fn safe_path_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 async fn materialize_git_checkout(

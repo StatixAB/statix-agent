@@ -30,9 +30,13 @@ pub struct AgentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedAgentConfig {
+    #[serde(alias = "nodeId")]
     pub node_id: String,
+    #[serde(alias = "nodeToken")]
     pub node_token: String,
+    #[serde(alias = "agentWsUrl")]
     pub agent_ws_url: String,
+    #[serde(default, alias = "apiBaseUrl")]
     pub api_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wireguard: Option<WireGuardConfig>,
