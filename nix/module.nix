@@ -10,29 +10,16 @@ let
   json = pkgs.formats.json {};
   defaultPackage = pkgs.callPackage ./package.nix {};
   generatedConfig = json.generate "statix-agent.json" cfg.settings;
-  lxcHome = "${cfg.stateDir}/lxc";
-  lxcConfigDir = "${lxcHome}/.config/lxc";
-  lxcConfigFile = "${lxcConfigDir}/default.conf";
-  lxcPreStartScript = pkgs.writeShellScript "statix-agent-lxc-pre-start" ''
+  microvmRuntimeDeps = [
+    pkgs.cloud-utils
+    pkgs.openssh
+    pkgs.qemu-utils
+    pkgs.qemu_kvm
+  ];
+  microvmPreStartScript = pkgs.writeShellScript "statix-agent-microvm-pre-start" ''
     set -euo pipefail
 
-    install -d -m 0711 -o ${cfg.user} -g ${cfg.group} ${cfg.stateDir} ${lxcHome} ${lxcHome}/containers
-    install -d -m 0750 -o ${cfg.user} -g ${cfg.group} ${lxcHome}/.cache ${lxcHome}/.local ${lxcHome}/.local/share ${lxcHome}/.config ${lxcConfigDir}
-    install -d -m 0755 /run/lxc /run/lxc/nics
-    {
-      if [ -r /etc/lxc/default.conf ]; then
-        printf 'lxc.include = /etc/lxc/default.conf\n'
-      else
-        printf 'lxc.net.0.type = veth\n'
-        printf 'lxc.net.0.link = ${cfg.lxc.bridge}\n'
-        printf 'lxc.net.0.flags = up\n'
-      fi
-      printf 'lxc.idmap = u 0 %s %s\n' ${toString cfg.lxc.subIdStart} ${toString cfg.lxc.subIdCount}
-      printf 'lxc.idmap = g 0 %s %s\n' ${toString cfg.lxc.subIdStart} ${toString cfg.lxc.subIdCount}
-      printf 'lxc.apparmor.profile = unconfined\n'
-    } > ${lxcConfigFile}
-    chown ${cfg.user}:${cfg.group} ${lxcConfigFile}
-    chmod 0640 ${lxcConfigFile}
+    install -d -m 0700 -o ${cfg.user} -g ${cfg.group} ${cfg.stateDir} ${cfg.stateDir}/microvm ${cfg.stateDir}/microvm/projects
   '';
 in
 {
@@ -79,35 +66,11 @@ in
       description = "Group that runs the Statix agent service.";
     };
 
-    lxc = {
+    microvm = {
       enable = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Install and configure LXC support for Statix container jobs.";
-      };
-
-      bridge = lib.mkOption {
-        type = lib.types.str;
-        default = "lxcbr0";
-        description = "LXC bridge that statix-agent may attach veth devices to.";
-      };
-
-      usernetDevices = lib.mkOption {
-        type = lib.types.ints.positive;
-        default = 10;
-        description = "Number of LXC veth devices allowed for the agent user.";
-      };
-
-      subIdStart = lib.mkOption {
-        type = lib.types.ints.positive;
-        default = 100000;
-        description = "First subordinate uid/gid allocated to the agent user.";
-      };
-
-      subIdCount = lib.mkOption {
-        type = lib.types.ints.positive;
-        default = 65536;
-        description = "Number of subordinate uid/gid values allocated to the agent user.";
+        description = "Install and configure microVM runtime support for Statix project jobs.";
       };
     };
 
@@ -126,34 +89,23 @@ in
       }
     ];
 
-    users.groups.${cfg.group} = {};
+    users.groups = {
+      ${cfg.group} = {};
+    }
+    // lib.optionalAttrs cfg.microvm.enable {
+      kvm = {};
+    };
     users.users.${cfg.user} = {
       isSystemUser = true;
       group = cfg.group;
       home = cfg.stateDir;
-    }
-    // lib.optionalAttrs cfg.lxc.enable {
-      subUidRanges = [
-        {
-          startUid = cfg.lxc.subIdStart;
-          count = cfg.lxc.subIdCount;
-        }
-      ];
-      subGidRanges = [
-        {
-          startGid = cfg.lxc.subIdStart;
-          count = cfg.lxc.subIdCount;
-        }
-      ];
+      extraGroups = lib.optionals cfg.microvm.enable [ "kvm" ];
     };
 
     environment.systemPackages = [
       cfg.package
     ]
-    ++ lib.optionals cfg.lxc.enable [
-      pkgs.lxc
-      pkgs.shadow
-    ]
+    ++ lib.optionals cfg.microvm.enable microvmRuntimeDeps
     ++ lib.optionals cfg.wireguardTools [
       pkgs.wireguard-tools
     ];
@@ -165,26 +117,14 @@ in
         group = cfg.group;
         mode = "0400";
       };
-    }
-    // lib.optionalAttrs cfg.lxc.enable {
-      "lxc/lxc-usernet".text = "${cfg.user} veth ${cfg.lxc.bridge} ${toString cfg.lxc.usernetDevices}\n";
     };
-
-    virtualisation.lxc.enable = lib.mkIf cfg.lxc.enable true;
 
     systemd.tmpfiles.rules = [
       "d ${cfg.stateDir} 0700 ${cfg.user} ${cfg.group} - -"
     ]
-    ++ lib.optionals cfg.lxc.enable [
-      "d ${lxcHome} 0711 ${cfg.user} ${cfg.group} - -"
-      "d ${lxcHome}/containers 0711 ${cfg.user} ${cfg.group} - -"
-      "d ${lxcHome}/.cache 0750 ${cfg.user} ${cfg.group} - -"
-      "d ${lxcHome}/.local 0750 ${cfg.user} ${cfg.group} - -"
-      "d ${lxcHome}/.local/share 0750 ${cfg.user} ${cfg.group} - -"
-      "d ${lxcHome}/.config 0750 ${cfg.user} ${cfg.group} - -"
-      "d ${lxcConfigDir} 0750 ${cfg.user} ${cfg.group} - -"
-      "d /run/lxc 0755 root root - -"
-      "d /run/lxc/nics 0755 root root - -"
+    ++ lib.optionals cfg.microvm.enable [
+      "d ${cfg.stateDir}/microvm 0700 ${cfg.user} ${cfg.group} - -"
+      "d ${cfg.stateDir}/microvm/projects 0700 ${cfg.user} ${cfg.group} - -"
     ];
 
     systemd.services.statix-agent = {
@@ -197,10 +137,10 @@ in
       environment = {
         STATIX_AGENT_CONFIG = toString cfg.configFile;
         STATIX_AGENT_STATE_DIR = cfg.stateDir;
-      }
-      // lib.optionalAttrs cfg.lxc.enable {
         HOME = cfg.stateDir;
       };
+
+      path = lib.optionals cfg.microvm.enable microvmRuntimeDeps;
 
       serviceConfig = {
         Type = "simple";
@@ -214,21 +154,21 @@ in
         WorkingDirectory = cfg.stateDir;
         RuntimeDirectory = "statix-agent";
         RuntimeDirectoryMode = "0700";
-        ReadWritePaths = [ cfg.stateDir ] ++ lib.optional cfg.lxc.enable "-/run/lxc";
+        ReadWritePaths = [ cfg.stateDir ];
         NoNewPrivileges = false;
-        Delegate = lib.mkIf cfg.lxc.enable true;
+        Delegate = lib.mkIf cfg.microvm.enable true;
         PrivateTmp = true;
         PrivateDevices = false;
         ProtectHome = "read-only";
         ProtectSystem = "strict";
-        ProtectControlGroups = lib.mkIf cfg.lxc.enable false;
-        ProtectKernelTunables = lib.mkIf cfg.lxc.enable false;
+        DeviceAllow = lib.mkIf cfg.microvm.enable [ "/dev/kvm rw" ];
+        ProtectControlGroups = lib.mkIf cfg.microvm.enable false;
+        ProtectKernelTunables = lib.mkIf cfg.microvm.enable false;
         ProtectKernelModules = true;
-        RestrictSUIDSGID = lib.mkIf cfg.lxc.enable false;
-        RestrictNamespaces = lib.mkIf cfg.lxc.enable false;
+        RestrictNamespaces = lib.mkIf cfg.microvm.enable false;
       }
-      // lib.optionalAttrs cfg.lxc.enable {
-        ExecStartPre = "+${lxcPreStartScript}";
+      // lib.optionalAttrs cfg.microvm.enable {
+        ExecStartPre = "+${microvmPreStartScript}";
       };
     };
   };

@@ -1,10 +1,10 @@
 name: test
 task:
-  executor: container
+  executor: microvm
   execution:
     environment:
-      type: container
-      image: ubuntu:24.04
+      type: microvm
+      image: ubuntu-24.04
   command:
     - bash
     - -lc

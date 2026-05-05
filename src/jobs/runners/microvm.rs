@@ -30,6 +30,14 @@ pub struct MicrovmRunner {
     memory_mb: Option<u32>,
 }
 
+pub struct ProjectMicrovmRunner {
+    project_id: String,
+    environment: String,
+    image: String,
+    cpu: Option<u8>,
+    memory_mb: Option<u32>,
+}
+
 struct QemuProcess {
     child: Option<Child>,
     recent_logs: Arc<Mutex<VecDeque<String>>>,
@@ -94,6 +102,24 @@ impl Drop for QemuProcess {
 impl MicrovmRunner {
     pub fn new(image: String, cpu: Option<u8>, memory_mb: Option<u32>) -> Self {
         Self {
+            image,
+            cpu,
+            memory_mb,
+        }
+    }
+}
+
+impl ProjectMicrovmRunner {
+    pub fn new(
+        project_id: String,
+        environment: String,
+        image: String,
+        cpu: Option<u8>,
+        memory_mb: Option<u32>,
+    ) -> Self {
+        Self {
+            project_id,
+            environment,
             image,
             cpu,
             memory_mb,
@@ -216,6 +242,91 @@ impl Runner for MicrovmRunner {
         eprintln!("[statix-agent] job {}: shutting down microvm", ctx.job_id);
         qemu.shutdown().await;
 
+        result
+    }
+}
+
+#[async_trait::async_trait]
+impl Runner for ProjectMicrovmRunner {
+    async fn execute(
+        &self,
+        ctx: &ExecutionContext,
+        workspace: &PreparedWorkspace,
+        command: &[String],
+    ) -> Result<JobExecutionResult> {
+        if ctx.timeout_seconds == 0 || ctx.timeout_seconds > 3600 {
+            bail!("run timeoutSeconds must be between 1 and 3600");
+        }
+        if command.is_empty() {
+            bail!("run command must contain at least one token");
+        }
+
+        let vm_key = project_vm_key(&self.project_id, &self.environment);
+        let runtime_root = agent_state_dir()?
+            .join("microvm")
+            .join("projects")
+            .join(&vm_key);
+        fs::create_dir_all(&runtime_root)
+            .with_context(|| format!("failed to create {}", runtime_root.display()))?;
+        eprintln!(
+            "[statix-agent] job {}: preparing project microvm {} at {}",
+            ctx.job_id,
+            vm_key,
+            runtime_root.display()
+        );
+
+        let base_image = resolve_base_image(&self.image, &runtime_root).await?;
+        let overlay_image = runtime_root.join("disk.qcow2");
+        if !overlay_image.exists() {
+            create_overlay_disk(&base_image, &overlay_image).await?;
+        }
+
+        let ssh_dir = runtime_root.join("ssh");
+        fs::create_dir_all(&ssh_dir)
+            .with_context(|| format!("failed to create {}", ssh_dir.display()))?;
+        let private_key = ssh_dir.join("id_ed25519");
+        let public_key = ssh_dir.join("id_ed25519.pub");
+        if !private_key.exists() || !public_key.exists() {
+            generate_ssh_keypair(&private_key, &public_key).await?;
+        }
+
+        let seed_iso = runtime_root.join("seed.iso");
+        if !seed_iso.exists() {
+            create_cloud_init_seed(&seed_iso, &public_key).await?;
+        }
+
+        let ssh_port = project_vm_ssh_port(&vm_key);
+        if !guest_ready(ssh_port, &private_key).await {
+            launch_project_qemu(
+                &runtime_root,
+                &overlay_image,
+                &seed_iso,
+                self.cpu.unwrap_or(DEFAULT_CPU_COUNT),
+                self.memory_mb.unwrap_or(DEFAULT_MEMORY_MB),
+                ssh_port,
+            )
+            .await?;
+        }
+
+        wait_for_project_guest_ready(ssh_port, &private_key, ctx.timeout_seconds).await?;
+
+        let workspace_tar = runtime_root.join(format!(
+            "workspace-{}.tar.gz",
+            safe_path_segment(&ctx.attempt_id)
+        ));
+        create_workspace_archive(&workspace_tar, &workspace.workdir).await?;
+
+        let result = run_guest_command(
+            ssh_port,
+            &private_key,
+            ctx.timeout_seconds,
+            command,
+            workspace,
+            &workspace_tar,
+        )
+        .await;
+
+        let _ = fs::remove_file(workspace_tar);
         result
     }
 }
@@ -358,11 +469,15 @@ packages:
   - build-essential
   - ca-certificates
   - curl
+  - docker.io
+  - docker-compose-v2
   - git
   - libssl-dev
   - openssh-server
   - pkg-config
 runcmd:
+  - [systemctl, enable, --now, docker]
+  - [usermod, -aG, docker, "{user}"]
   - [su, "-", "{user}", "-c", "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable"]
 "#,
         user = DEFAULT_SSH_USER,
@@ -425,6 +540,64 @@ async fn launch_qemu(
         child: Some(child),
         recent_logs,
     })
+}
+
+async fn launch_project_qemu(
+    runtime_root: &Path,
+    overlay_image: &Path,
+    seed_iso: &Path,
+    cpu: u8,
+    memory_mb: u32,
+    ssh_port: u16,
+) -> Result<()> {
+    let binary = qemu_binary()?;
+    let stdout = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(runtime_root.join("qemu.stdout.log"))
+        .with_context(|| {
+            format!(
+                "failed to open {}",
+                runtime_root.join("qemu.stdout.log").display()
+            )
+        })?;
+    let stderr = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(runtime_root.join("qemu.stderr.log"))
+        .with_context(|| {
+            format!(
+                "failed to open {}",
+                runtime_root.join("qemu.stderr.log").display()
+            )
+        })?;
+    let child = Command::new(binary)
+        .args(qemu_launch_args(
+            overlay_image,
+            seed_iso,
+            cpu,
+            memory_mb,
+            ssh_port,
+        ))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .with_context(|| missing_dependency_message(binary, qemu_package_hint()))?;
+
+    fs::write(runtime_root.join("qemu.pid"), child.id().to_string()).with_context(|| {
+        format!(
+            "failed to write {}",
+            runtime_root.join("qemu.pid").display()
+        )
+    })?;
+    eprintln!(
+        "[statix-agent] launched project microvm pid {} with {} cpu(s), {} MiB memory, ssh port {}",
+        child.id(),
+        cpu,
+        memory_mb,
+        ssh_port
+    );
+    Ok(())
 }
 
 fn qemu_launch_args(
@@ -565,6 +738,55 @@ async fn wait_for_guest_ready(
 
         sleep(Duration::from_secs(2)).await;
     }
+}
+
+async fn wait_for_project_guest_ready(
+    ssh_port: u16,
+    private_key: &Path,
+    timeout_seconds: u64,
+) -> Result<()> {
+    let deadline = Duration::from_secs(timeout_seconds);
+    let start = Instant::now();
+    let mut next_progress_log = Duration::from_secs(15);
+
+    loop {
+        if start.elapsed() >= deadline {
+            bail!("project microvm did not become ready before timeout");
+        }
+
+        if guest_ready(ssh_port, private_key).await {
+            return Ok(());
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed >= next_progress_log {
+            eprintln!(
+                "[statix-agent] waiting for project microvm guest readiness for {}s",
+                elapsed.as_secs()
+            );
+            next_progress_log += Duration::from_secs(15);
+        }
+
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn guest_ready(ssh_port: u16, private_key: &Path) -> bool {
+    let mut probe = TokioCommand::new("ssh");
+    probe.arg("-i").arg(private_key);
+    add_common_ssh_options(&mut probe, 3);
+    probe
+        .arg("-p")
+        .arg(ssh_port.to_string())
+        .arg(format!("{}@127.0.0.1", DEFAULT_SSH_USER))
+        .arg("test")
+        .arg("-f")
+        .arg("/var/lib/cloud/instance/boot-finished");
+
+    matches!(
+        timeout(Duration::from_secs(5), probe.output()).await,
+        Ok(Ok(output)) if output.status.success()
+    )
 }
 
 async fn run_guest_command(
@@ -780,6 +1002,45 @@ fn image_cache_key(url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(url.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+fn project_vm_key(project_id: &str, environment: &str) -> String {
+    format!(
+        "{}-{}-{}",
+        safe_path_segment(project_id),
+        safe_path_segment(environment),
+        image_cache_key(&format!("{project_id}:{environment}"))[..12].to_string()
+    )
+}
+
+fn project_vm_ssh_port(vm_key: &str) -> u16 {
+    let mut hasher = Sha256::new();
+    hasher.update(vm_key.as_bytes());
+    let digest = hasher.finalize();
+    let value = u16::from_be_bytes([digest[0], digest[1]]);
+    22_200 + (value % 1_000)
+}
+
+fn safe_path_segment(value: &str) -> String {
+    let mut out = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "default".to_string()
+    } else {
+        out
+    }
 }
 
 #[cfg(test)]

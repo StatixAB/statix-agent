@@ -20,9 +20,6 @@ pub struct AgentConfig {
     pub reconnect_delay_ms: u64,
     pub connect_timeout_ms: u64,
     pub wireguard: Option<WireGuardConfig>,
-    pub container_default_image: String,
-    pub container_default_cpu: u8,
-    pub container_default_memory_mb: u32,
     pub microvm_default_image: String,
     pub microvm_default_cpu: u8,
     pub microvm_default_memory_mb: u32,
@@ -175,13 +172,6 @@ impl AgentConfig {
             reconnect_delay_ms: parse_positive_int("RECONNECT_DELAY_MS", 3_000),
             connect_timeout_ms: parse_positive_int("WS_CONNECT_TIMEOUT_MS", 8_000),
             wireguard: resolve_wireguard_config(persisted.as_ref()),
-            container_default_image: env::var("STATIX_CONTAINER_IMAGE")
-                .ok()
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "ubuntu:24.04".to_string()),
-            container_default_cpu: parse_positive_u8("STATIX_CONTAINER_CPU", 2),
-            container_default_memory_mb: parse_positive_u32("STATIX_CONTAINER_MEMORY_MB", 4096),
             microvm_default_image: env::var("STATIX_MICROVM_IMAGE")
                 .ok()
                 .map(|value| value.trim().to_owned())

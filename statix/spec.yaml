@@ -11,7 +11,7 @@ metadata:
     component: agent
 
 defaults:
-  runtime: container
+  runtime: microvm
   shell: bash
   timeoutSeconds: 1800
   retryLimit: 0
@@ -20,7 +20,7 @@ defaults:
 
 resources:
   default:
-    executor: container
+    executor: microvm
     profile: standard
 
 setups:
@@ -44,4 +44,3 @@ workflows:
     - task: test
 
 deployments: {}
-

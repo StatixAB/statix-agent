@@ -7,13 +7,14 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub enum RunnerEnvironment {
-    Host,
-    Container {
+    Microvm {
         image: String,
         cpu: Option<u8>,
         memory_mb: Option<u32>,
     },
-    Microvm {
+    ProjectMicrovm {
+        project_id: String,
+        environment: String,
         image: String,
         cpu: Option<u8>,
         memory_mb: Option<u32>,
@@ -83,20 +84,6 @@ pub async fn execute(
     command: &[String],
 ) -> Result<JobExecutionResult> {
     match environment {
-        RunnerEnvironment::Host => {
-            runners::host::HostRunner
-                .execute(ctx, workspace, command)
-                .await
-        }
-        RunnerEnvironment::Container {
-            image,
-            cpu,
-            memory_mb,
-        } => {
-            runners::container::ContainerRunner::new(image.clone(), *cpu, *memory_mb)
-                .execute(ctx, workspace, command)
-                .await
-        }
         RunnerEnvironment::Microvm {
             image,
             cpu,
@@ -105,6 +92,23 @@ pub async fn execute(
             runners::microvm::MicrovmRunner::new(image.clone(), *cpu, *memory_mb)
                 .execute(ctx, workspace, command)
                 .await
+        }
+        RunnerEnvironment::ProjectMicrovm {
+            project_id,
+            environment,
+            image,
+            cpu,
+            memory_mb,
+        } => {
+            runners::microvm::ProjectMicrovmRunner::new(
+                project_id.clone(),
+                environment.clone(),
+                image.clone(),
+                *cpu,
+                *memory_mb,
+            )
+            .execute(ctx, workspace, command)
+            .await
         }
     }
 }

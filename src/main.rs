@@ -99,15 +99,6 @@ struct AgentJob {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum JobEnvironment {
-    Host,
-    Container {
-        #[serde(default)]
-        image: Option<String>,
-        #[serde(default)]
-        cpu: Option<u8>,
-        #[serde(rename = "memoryMb", default)]
-        memory_mb: Option<u32>,
-    },
     Microvm {
         #[serde(default)]
         image: Option<String>,
@@ -158,7 +149,7 @@ enum AgentJobSpec {
         #[serde(rename = "bundleId")]
         _bundle_id: String,
         #[serde(rename = "projectId")]
-        _project_id: String,
+        project_id: String,
         environment: String,
         #[serde(rename = "dryRun", default)]
         dry_run: bool,
@@ -764,25 +755,20 @@ async fn execute_job(
                 attempt_id: None,
                 environment: None,
             });
-            let environment = match execution.environment.unwrap_or(JobEnvironment::Host) {
-                JobEnvironment::Host => RunnerEnvironment::Host,
-                JobEnvironment::Container {
+            let environment = match execution.environment {
+                Some(JobEnvironment::Microvm {
                     image,
                     cpu,
                     memory_mb,
-                } => RunnerEnvironment::Container {
-                    image: image.unwrap_or_else(|| config.container_default_image.clone()),
-                    cpu: cpu.or(Some(config.container_default_cpu)),
-                    memory_mb: memory_mb.or(Some(config.container_default_memory_mb)),
-                },
-                JobEnvironment::Microvm {
-                    image,
-                    cpu,
-                    memory_mb,
-                } => RunnerEnvironment::Microvm {
+                }) => RunnerEnvironment::Microvm {
                     image: image.unwrap_or_else(|| config.microvm_default_image.clone()),
                     cpu: cpu.or(Some(config.microvm_default_cpu)),
                     memory_mb: memory_mb.or(Some(config.microvm_default_memory_mb)),
+                },
+                None => RunnerEnvironment::Microvm {
+                    image: config.microvm_default_image.clone(),
+                    cpu: Some(config.microvm_default_cpu),
+                    memory_mb: Some(config.microvm_default_memory_mb),
                 },
             };
             eprintln!(
@@ -806,6 +792,7 @@ async fn execute_job(
         }
         AgentJobSpec::DeployBundle {
             deployment_id,
+            project_id,
             environment,
             dry_run,
             bundle,
@@ -822,25 +809,24 @@ async fn execute_job(
                 attempt_id: None,
                 environment: None,
             });
-            let runner_environment = match execution.environment.unwrap_or(JobEnvironment::Host) {
-                JobEnvironment::Host => RunnerEnvironment::Host,
-                JobEnvironment::Container {
+            let runner_environment = match execution.environment {
+                Some(JobEnvironment::Microvm {
                     image,
                     cpu,
                     memory_mb,
-                } => RunnerEnvironment::Container {
-                    image: image.unwrap_or_else(|| config.container_default_image.clone()),
-                    cpu: cpu.or(Some(config.container_default_cpu)),
-                    memory_mb: memory_mb.or(Some(config.container_default_memory_mb)),
-                },
-                JobEnvironment::Microvm {
-                    image,
-                    cpu,
-                    memory_mb,
-                } => RunnerEnvironment::Microvm {
+                }) => RunnerEnvironment::ProjectMicrovm {
+                    project_id: project_id.clone(),
+                    environment: environment.clone(),
                     image: image.unwrap_or_else(|| config.microvm_default_image.clone()),
                     cpu: cpu.or(Some(config.microvm_default_cpu)),
                     memory_mb: memory_mb.or(Some(config.microvm_default_memory_mb)),
+                },
+                None => RunnerEnvironment::ProjectMicrovm {
+                    project_id: project_id.clone(),
+                    environment: environment.clone(),
+                    image: config.microvm_default_image.clone(),
+                    cpu: Some(config.microvm_default_cpu),
+                    memory_mb: Some(config.microvm_default_memory_mb),
                 },
             };
             let timeout_seconds = timeout_seconds.unwrap_or(1800);
@@ -909,11 +895,40 @@ async fn execute_job(
                     log_tx: Some(log_tx),
                 },
                 &workspace,
-                &env_command(&command, &command_env),
+                &project_systemd_command(
+                    project_id,
+                    environment,
+                    &env_command(&command, &command_env),
+                ),
             )
             .await
         }
     }
+}
+
+fn project_systemd_command(project_id: &str, environment: &str, command: &[String]) -> Vec<String> {
+    let unit_name = format!(
+        "statix-project-{}-{}.service",
+        safe_path_segment(project_id),
+        safe_path_segment(environment)
+    );
+    let command = shell_join(command);
+    let service = format!(
+        "[Unit]\nDescription=Statix project {project_id} ({environment})\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser={user}\nWorkingDirectory=/home/{user}/workspace\nEnvironment=HOME=/home/{user}\nExecStart=/bin/bash -lc {command}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        user = "statix",
+        command = shell_escape(&command)
+    );
+    vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        format!(
+            "printf %s {} | sudo tee /etc/systemd/system/{} >/dev/null && sudo systemctl daemon-reload && sudo systemctl enable --now {} && sudo systemctl restart {}",
+            shell_escape(&service),
+            shell_escape(&unit_name),
+            shell_escape(&unit_name),
+            shell_escape(&unit_name)
+        ),
+    ]
 }
 
 fn env_command(command: &[String], env: &BTreeMap<String, String>) -> Vec<String> {
@@ -949,9 +964,8 @@ fn shell_env_key(key: &str) -> Option<String> {
 
 fn runner_environment_label(environment: &RunnerEnvironment) -> &'static str {
     match environment {
-        RunnerEnvironment::Host => "host",
-        RunnerEnvironment::Container { .. } => "container",
         RunnerEnvironment::Microvm { .. } => "microvm",
+        RunnerEnvironment::ProjectMicrovm { .. } => "project microvm",
     }
 }
 
