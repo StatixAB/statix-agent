@@ -11,7 +11,9 @@ let
   defaultPackage = pkgs.callPackage ./package.nix {};
   generatedConfig = json.generate "statix-agent.json" cfg.settings;
   microvmRuntimeDeps = [
+    pkgs.caddy
     pkgs.cloud-utils
+    pkgs.iproute2
     pkgs.openssh
     pkgs.qemu-utils
     pkgs.qemu_kvm
@@ -19,7 +21,7 @@ let
   microvmPreStartScript = pkgs.writeShellScript "statix-agent-microvm-pre-start" ''
     set -euo pipefail
 
-    install -d -m 0700 -o ${cfg.user} -g ${cfg.group} ${cfg.stateDir} ${cfg.stateDir}/microvm ${cfg.stateDir}/microvm/projects
+    install -d -m 0700 -o ${cfg.user} -g ${cfg.group} ${cfg.stateDir} ${cfg.stateDir}/microvm ${cfg.stateDir}/microvm/projects ${cfg.stateDir}/networking ${cfg.stateDir}/networking/proxy
   '';
 in
 {
@@ -125,6 +127,8 @@ in
     ++ lib.optionals cfg.microvm.enable [
       "d ${cfg.stateDir}/microvm 0700 ${cfg.user} ${cfg.group} - -"
       "d ${cfg.stateDir}/microvm/projects 0700 ${cfg.user} ${cfg.group} - -"
+      "d ${cfg.stateDir}/networking 0700 ${cfg.user} ${cfg.group} - -"
+      "d ${cfg.stateDir}/networking/proxy 0700 ${cfg.user} ${cfg.group} - -"
     ];
 
     systemd.services.statix-agent = {
@@ -156,12 +160,14 @@ in
         RuntimeDirectoryMode = "0700";
         ReadWritePaths = [ cfg.stateDir ];
         NoNewPrivileges = false;
+        AmbientCapabilities = lib.mkIf cfg.microvm.enable [ "CAP_NET_ADMIN" "CAP_NET_BIND_SERVICE" ];
+        CapabilityBoundingSet = lib.mkIf cfg.microvm.enable [ "CAP_NET_ADMIN" "CAP_NET_BIND_SERVICE" ];
         Delegate = lib.mkIf cfg.microvm.enable true;
         PrivateTmp = true;
         PrivateDevices = false;
         ProtectHome = "read-only";
         ProtectSystem = "strict";
-        DeviceAllow = lib.mkIf cfg.microvm.enable [ "/dev/kvm rw" ];
+        DeviceAllow = lib.mkIf cfg.microvm.enable [ "/dev/kvm rw" "/dev/net/tun rw" ];
         ProtectControlGroups = lib.mkIf cfg.microvm.enable false;
         ProtectKernelTunables = lib.mkIf cfg.microvm.enable false;
         ProtectKernelModules = true;

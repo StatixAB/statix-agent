@@ -27,6 +27,7 @@ pub struct ExecutionContext {
     pub attempt_id: String,
     pub timeout_seconds: u64,
     pub log_tx: Option<mpsc::UnboundedSender<JobLogLine>>,
+    pub exposure: Vec<crate::networking::ExposureRequest>,
 }
 
 impl ExecutionContext {

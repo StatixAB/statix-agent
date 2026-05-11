@@ -1,7 +1,9 @@
 mod config;
 mod enrollment;
 mod jobs;
+mod logs;
 mod metrics;
+mod networking;
 mod system_info;
 mod wireguard;
 
@@ -157,6 +159,8 @@ enum AgentJobSpec {
         #[serde(default)]
         setup: Vec<DeploymentSetup>,
         #[serde(default)]
+        exposure: Vec<DeploymentExposureConfig>,
+        #[serde(default)]
         command: Vec<String>,
         #[serde(default)]
         env: BTreeMap<String, String>,
@@ -164,6 +168,16 @@ enum AgentJobSpec {
         timeout_seconds: Option<u64>,
         #[serde(default)]
         execution: Option<JobExecutionConfig>,
+    },
+    #[serde(rename = "stop_deployment")]
+    StopDeployment {
+        #[serde(rename = "deploymentId")]
+        deployment_id: String,
+        #[serde(rename = "projectId")]
+        project_id: String,
+        environment: String,
+        #[serde(rename = "execution", default)]
+        _execution: Option<JobExecutionConfig>,
     },
 }
 
@@ -200,6 +214,22 @@ struct DeploymentSetup {
     run: Vec<String>,
     #[serde(default)]
     exports: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DeploymentExposureConfig {
+    #[serde(default)]
+    host: Option<String>,
+    target_port: u16,
+    #[serde(default)]
+    visibility: Option<networking::ExposureVisibility>,
+    #[serde(default)]
+    workspace_public_http_allowed: bool,
+    #[serde(default)]
+    node_ingress_allowed: bool,
+    #[serde(default = "default_project_exposure_allowed")]
+    project_exposure_allowed: bool,
 }
 
 enum SessionOutcome {
@@ -260,7 +290,7 @@ impl LoginArgs {
 #[tokio::main]
 async fn main() {
     if let Err(error) = dispatch().await {
-        eprintln!("[statix-agent] fatal error: {error:#}");
+        logs::agent_error(format!("fatal error: {error:#}"));
         std::process::exit(1);
     }
 }
@@ -293,7 +323,10 @@ async fn run_agent() -> Result<()> {
     let config = AgentConfig::load()?.context(
         "Agent identity not configured. Run `statix-agent login --api-base-url http://host:3001` with STATIX_AGENT_CONFIG pointing at the service config, or set NODE_ID/NODE_TOKEN in the environment.",
     )?;
-    eprintln!("[statix-agent] starting with nodeId: {}", config.node_id);
+    logs::agent_info(format!("starting with nodeId: {}", config.node_id));
+    if let Err(error) = networking::reconcile_on_start() {
+        logs::agent_warn(format!("networking reconciliation failed: {error:#}"));
+    }
     log_verbose(&format!(
         "runtime config: ws={}, api={}, publish={}ms, system-check={}ms",
         config.agent_ws_url,
@@ -309,14 +342,14 @@ async fn run_agent() -> Result<()> {
     {
         match ensure_wireguard_applied(wireguard).await {
             Ok(path) => {
-                eprintln!(
-                    "[statix-agent] wireguard applied on {} using {}",
+                logs::agent_info(format!(
+                    "wireguard applied on {} using {}",
                     wireguard.interface_name,
                     path.display()
-                );
+                ));
             }
             Err(error) => {
-                eprintln!("[statix-agent] wireguard apply failed: {error:#}");
+                logs::agent_warn(format!("wireguard apply failed: {error:#}"));
             }
         }
     }
@@ -330,7 +363,7 @@ async fn run_agent() -> Result<()> {
         match run_session(&config, stop_rx_main.clone()).await {
             Ok(SessionOutcome::Stopped) => break,
             Err(error) => {
-                eprintln!("[statix-agent] session failed: {error:#}");
+                logs::agent_error(format!("session failed: {error:#}"));
             }
         }
 
@@ -348,7 +381,7 @@ async fn run_agent() -> Result<()> {
         }
     }
 
-    eprintln!("[statix-agent] stopped");
+    logs::agent_info("stopped");
     Ok(())
 }
 
@@ -370,7 +403,7 @@ async fn run_session(
     .context("failed to connect websocket")?;
     let (mut ws, _) = connect;
 
-    eprintln!("[statix-agent] connected to {}", config.agent_ws_url);
+    logs::agent_info(format!("connected to {}", config.agent_ws_url));
 
     send_client_message(
         &mut ws,
@@ -388,7 +421,7 @@ async fn run_session(
     let mut last_system_info_published_at: Option<Instant> = None;
 
     if let Err(error) = send_initial_metrics(&mut ws).await {
-        eprintln!("[statix-agent] publish failed: {error:#}");
+        logs::agent_warn(format!("publish failed: {error:#}"));
     }
 
     if let Err(error) = send_initial_system_info(
@@ -399,7 +432,7 @@ async fn run_session(
     )
     .await
     {
-        eprintln!("[statix-agent] system info publish failed: {error:#}");
+        logs::agent_warn(format!("system info publish failed: {error:#}"));
     }
 
     let mut publish_tick = interval(Duration::from_millis(config.publish_interval_ms));
@@ -459,7 +492,7 @@ async fn run_session(
             };
 
             if let Err(error) = send_result {
-                eprintln!("[statix-agent] outbound send failed: {error:#}");
+                logs::agent_error(format!("outbound send failed: {error:#}"));
                 break;
             }
         }
@@ -471,13 +504,13 @@ async fn run_session(
         if !active_job {
             if let Some(job) = queued_jobs.pop_front() {
                 active_job = true;
-                eprintln!("[statix-agent] job {}: accepted", job.id);
+                logs::job_phase_info(&job.id, "queue", "accepted");
                 let accepted = outbound_tx.send(OutboundMessage::JobStatus {
                     job_id: job.id.clone(),
                     status: "accepted",
                     message: None,
                 });
-                eprintln!("[statix-agent] job {}: started", job.id);
+                logs::job_phase_info(&job.id, "queue", "started");
                 let started = outbound_tx.send(OutboundMessage::JobStatus {
                     job_id: job.id.clone(),
                     status: "started",
@@ -503,9 +536,10 @@ async fn run_session(
                             message: Some(format_error_chain(&error)),
                         },
                     };
-                    eprintln!(
-                        "[statix-agent] job {}: completed locally with status {}",
-                        completed.job_id, completed.status
+                    logs::job_phase_info(
+                        &completed.job_id,
+                        "queue",
+                        format!("completed locally with status {}", completed.status),
                     );
                     let _ = job_done_tx.send(completed);
                 });
@@ -555,7 +589,7 @@ async fn run_session(
             },
             _ = publish_tick.tick() => {
                 if let Err(error) = publish_metrics_once(&outbound_tx).await {
-                    eprintln!("[statix-agent] publish failed: {error:#}");
+                    logs::agent_warn(format!("publish failed: {error:#}"));
                 }
             }
             _ = system_tick.tick() => {
@@ -567,7 +601,7 @@ async fn run_session(
                     &mut last_system_info_hash,
                     &mut last_system_info_published_at,
                 ).await {
-                    eprintln!("[statix-agent] system info publish failed: {error:#}");
+                    logs::agent_warn(format!("system info publish failed: {error:#}"));
                 }
             }
             completed = job_done_rx.recv() => {
@@ -591,8 +625,10 @@ async fn run_session(
                 }).is_err() {
                     return Err(anyhow!("websocket writer is unavailable"));
                 }
-                eprintln!(
-                    "[statix-agent] job {job_id}: {status} status update queued for websocket delivery"
+                logs::job_phase_info(
+                    &job_id,
+                    "transmit",
+                    format!("{status} status update queued for websocket delivery"),
                 );
             }
             log = job_log_rx.recv() => {
@@ -771,10 +807,13 @@ async fn execute_job(
                     memory_mb: Some(config.microvm_default_memory_mb),
                 },
             };
-            eprintln!(
-                "[statix-agent] job {}: executing cargo_test in {} environment",
-                job.id,
-                runner_environment_label(&environment)
+            logs::job_phase_info(
+                &job.id,
+                "dispatch",
+                format!(
+                    "executing cargo_test in {} environment",
+                    runner_environment_label(&environment)
+                ),
             );
 
             jobs::execute(
@@ -784,6 +823,7 @@ async fn execute_job(
                     attempt_id: execution.attempt_id.unwrap_or_else(|| job.id.clone()),
                     timeout_seconds: timeout_seconds.unwrap_or(1800),
                     log_tx: Some(log_tx),
+                    exposure: Vec::new(),
                 },
                 &workspace,
                 &cargo_test_command(args),
@@ -797,6 +837,7 @@ async fn execute_job(
             dry_run,
             bundle,
             setup,
+            exposure,
             command,
             env,
             timeout_seconds,
@@ -830,6 +871,19 @@ async fn execute_job(
                 },
             };
             let timeout_seconds = timeout_seconds.unwrap_or(1800);
+            let exposure = exposure
+                .iter()
+                .map(|request| networking::ExposureRequest {
+                    host: request.host.clone(),
+                    target_port: request.target_port,
+                    visibility: request
+                        .visibility
+                        .unwrap_or(networking::ExposureVisibility::Private),
+                    workspace_public_http_allowed: request.workspace_public_http_allowed,
+                    node_ingress_allowed: request.node_ingress_allowed,
+                    project_exposure_allowed: request.project_exposure_allowed,
+                })
+                .collect::<Vec<_>>();
             let job_id = execution.job_id.unwrap_or_else(|| deployment_id.clone());
             let attempt_id = execution.attempt_id.unwrap_or_else(|| job.id.clone());
             let mut command_env = env.clone();
@@ -839,10 +893,13 @@ async fn execute_job(
                 environment.clone(),
             );
 
-            eprintln!(
-                "[statix-agent] job {}: executing deploy_bundle in {} environment",
-                job.id,
-                runner_environment_label(&runner_environment)
+            logs::job_phase_info(
+                &job.id,
+                "dispatch",
+                format!(
+                    "executing deploy_bundle in {} environment",
+                    runner_environment_label(&runner_environment)
+                ),
             );
 
             for setup_step in setup {
@@ -860,6 +917,7 @@ async fn execute_job(
                         attempt_id: attempt_id.clone(),
                         timeout_seconds,
                         log_tx: Some(log_tx.clone()),
+                        exposure: exposure.clone(),
                     },
                     &workspace,
                     &setup_command,
@@ -893,6 +951,7 @@ async fn execute_job(
                     attempt_id,
                     timeout_seconds,
                     log_tx: Some(log_tx),
+                    exposure,
                 },
                 &workspace,
                 &project_systemd_command(
@@ -902,6 +961,22 @@ async fn execute_job(
                 ),
             )
             .await
+        }
+        AgentJobSpec::StopDeployment {
+            deployment_id,
+            project_id,
+            environment,
+            _execution: _,
+        } => {
+            logs::job_phase_info(
+                &job.id,
+                "dispatch",
+                format!(
+                    "stopping deployment {} for project {} ({})",
+                    deployment_id, project_id, environment
+                ),
+            );
+            jobs::runners::microvm::stop_project_service(project_id, environment).await
         }
     }
 }
@@ -929,6 +1004,10 @@ fn project_systemd_command(project_id: &str, environment: &str, command: &[Strin
             shell_escape(&unit_name)
         ),
     ]
+}
+
+fn default_project_exposure_allowed() -> bool {
+    true
 }
 
 fn env_command(command: &[String], env: &BTreeMap<String, String>) -> Vec<String> {
@@ -1224,14 +1303,8 @@ async fn materialize_git_checkout(
     Ok(repo_dir)
 }
 
-fn verbose_logs_enabled() -> bool {
-    env_flag("STATIX_VERBOSE_LOGS")
-}
-
 fn log_verbose(message: &str) {
-    if verbose_logs_enabled() {
-        eprintln!("[statix-agent][debug] {message}");
-    }
+    logs::agent_debug(message);
 }
 
 fn truncate_for_log(value: &str, max_chars: usize) -> String {

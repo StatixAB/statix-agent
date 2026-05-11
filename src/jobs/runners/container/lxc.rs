@@ -15,6 +15,7 @@ use tokio::{
 use crate::jobs::{
     ExecutionContext, JobExecutionResult, JobLogStream, PreparedWorkspace, summarize_command_output,
 };
+use crate::logs;
 
 use super::{
     archive::WORKSPACE_ARCHIVE,
@@ -221,10 +222,10 @@ impl LxcContainer {
     pub(super) async fn configure_guest_dns(&self, timeout_seconds: u64) -> Result<()> {
         let dns_config = container_dns_config();
         if dns_config.nameservers.is_empty() && !dns_config.include_default_gateway {
-            eprintln!(
-                "[statix-agent] lxc container {}: no non-loopback DNS resolvers found for guest",
+            logs::agent_warn(format!(
+                "lxc container {}: no non-loopback DNS resolvers found for guest",
                 self.name
-            );
+            ));
             return Ok(());
         }
 
@@ -237,20 +238,20 @@ impl LxcContainer {
                 summarize_raw_command_output(&output.stdout, &output.stderr)
             );
         }
-        eprintln!(
-            "[statix-agent] lxc container {}: configured guest DNS resolvers: {}",
+        logs::agent_info(format!(
+            "lxc container {}: configured guest DNS resolvers: {}",
             self.name,
             dns_config.display_nameservers()
-        );
+        ));
         Ok(())
     }
 
     pub(super) async fn configure_guest_network(&self, timeout_seconds: u64) -> Result<()> {
         let Some(network) = lxc_bridge_network() else {
-            eprintln!(
-                "[statix-agent] lxc container {}: could not detect lxc bridge IPv4 network; leaving guest network unchanged",
+            logs::agent_warn(format!(
+                "lxc container {}: could not detect lxc bridge IPv4 network; leaving guest network unchanged",
                 self.name
-            );
+            ));
             return Ok(());
         };
         let guest_address = guest_ipv4_address(&network, &self.name);
@@ -264,10 +265,10 @@ impl LxcContainer {
                 summarize_raw_command_output(&output.stdout, &output.stderr)
             );
         }
-        eprintln!(
-            "[statix-agent] lxc container {}: ensured guest IPv4 network {} via {}",
+        logs::agent_info(format!(
+            "lxc container {}: ensured guest IPv4 network {} via {}",
             self.name, guest_address, network.gateway
-        );
+        ));
         Ok(())
     }
 
@@ -301,10 +302,14 @@ impl LxcContainer {
         if !output.status.success() {
             let message =
                 summarize_command_output(&workspace.workdir, &output.stdout, &output.stderr);
-            eprintln!(
-                "[statix-agent] lxc container setup failed with {}; output: {}",
-                output.status,
-                truncate_for_log(&message, 1_000)
+            logs::job_phase_warn(
+                &ctx.job_id,
+                "container.setup",
+                format!(
+                    "lxc setup failed with {}; output: {}",
+                    output.status,
+                    truncate_for_log(&message, 1_000)
+                ),
             );
             return Ok(Some(JobExecutionResult {
                 status: "failed",
@@ -327,16 +332,20 @@ impl LxcContainer {
             command = shell_join(command)
         );
 
-        eprintln!(
-            "[statix-agent] running command inside lxc container {}: {}",
-            self.name,
-            shell_join(command)
+        logs::job_phase_info(
+            &ctx.job_id,
+            "container.command",
+            format!(
+                "running command inside lxc container {}: {}",
+                self.name,
+                shell_join(command)
+            ),
         );
         let output = self
             .attach_output(timeout_seconds, &guest_command, Some(ctx))
             .await?;
         if output.status.success() {
-            eprintln!("[statix-agent] lxc container command succeeded");
+            logs::job_phase_info(&ctx.job_id, "container.command", "lxc container command succeeded");
             Ok(JobExecutionResult {
                 status: "succeeded",
                 message: Some(format!(
@@ -347,10 +356,14 @@ impl LxcContainer {
         } else {
             let message =
                 summarize_command_output(&workspace.workdir, &output.stdout, &output.stderr);
-            eprintln!(
-                "[statix-agent] lxc container command failed with {}; output: {}",
-                output.status,
-                truncate_for_log(&message, 1_000)
+            logs::job_phase_warn(
+                &ctx.job_id,
+                "container.command",
+                format!(
+                    "lxc container command failed with {}; output: {}",
+                    output.status,
+                    truncate_for_log(&message, 1_000)
+                ),
             );
             Ok(JobExecutionResult {
                 status: "failed",
@@ -539,25 +552,21 @@ fn emit_stream_segment(
         return;
     }
 
-    let message = String::from_utf8_lossy(segment);
-    eprintln!(
-        "[statix-agent] lxc container {} {} | {}",
-        container_name,
-        stream_name.as_str(),
-        message
+    logs::process::emit_process_segment(
+        &format!("lxc.{container_name}"),
+        stream_name,
+        segment,
+        ctx,
     );
-    if let Some(ctx) = ctx {
-        ctx.emit_log(stream_name, message.into_owned());
-    }
 }
 
 impl Drop for LxcContainer {
     fn drop(&mut self) {
         if !self.destroyed {
-            eprintln!(
-                "[statix-agent] lxc container {} was not destroyed before drop; cleanup may be needed",
+            logs::agent_warn(format!(
+                "lxc container {} was not destroyed before drop; cleanup may be needed",
                 self.name
-            );
+            ));
         }
     }
 }

@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use crate::{
     config::agent_state_dir,
     jobs::{ExecutionContext, JobExecutionResult, PreparedWorkspace, Runner},
+    logs,
 };
 
 use super::{
@@ -59,21 +60,23 @@ impl Runner for ContainerRunner {
         fs::create_dir_all(&runtime_root)
             .with_context(|| format!("failed to create {}", runtime_root.display()))?;
 
-        eprintln!(
-            "[statix-agent] job {}: preparing lxc container {} from {}",
-            ctx.job_id, container_name, self.image
+        logs::job_phase_info(
+            &ctx.job_id,
+            "container.setup",
+            format!("preparing lxc container {} from {}", container_name, self.image),
         );
-        eprintln!(
-            "[statix-agent] job {}: requested container limits: {} cpu(s), {} MiB memory",
-            ctx.job_id, cpu, memory_mb
+        logs::job_phase_info(
+            &ctx.job_id,
+            "container.setup",
+            format!("requested limits: {} cpu(s), {} MiB memory", cpu, memory_mb),
         );
 
         let workspace_tar = runtime_root.join(WORKSPACE_ARCHIVE);
         create_workspace_archive(&workspace_tar, &workspace.workdir).await?;
-        eprintln!(
-            "[statix-agent] job {}: archived workspace {}",
-            ctx.job_id,
-            workspace.workdir.display()
+        logs::job_phase_info(
+            &ctx.job_id,
+            "container.setup",
+            format!("archived workspace {}", workspace.workdir.display()),
         );
 
         let mut container = LxcContainer::create(
@@ -104,9 +107,10 @@ impl Runner for ContainerRunner {
         }
         .await;
 
-        eprintln!(
-            "[statix-agent] job {}: destroying lxc container {}",
-            ctx.job_id, container_name
+        logs::job_phase_info(
+            &ctx.job_id,
+            "container.lifecycle",
+            format!("destroying lxc container {}", container_name),
         );
         container.destroy().await;
 
