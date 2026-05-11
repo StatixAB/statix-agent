@@ -12,9 +12,11 @@ use crate::logs;
 use crate::networking::VmNetworkLease;
 
 use super::util::{
-    missing_dependency_message, process_is_running, qemu_binary, qemu_package_hint,
+    missing_dependency_message, process_is_running, qemu_binary, qemu_package_hint, shell_join,
     truncate_for_log,
 };
+
+pub(super) const HOSTFWD_NET_MAC_ADDRESS: &str = "52:54:00:12:34:56";
 
 pub(super) struct QemuProcess {
     child: Option<Child>,
@@ -86,15 +88,10 @@ pub(super) async fn launch_qemu(
 ) -> Result<QemuProcess> {
     let binary = qemu_binary()?;
     let recent_logs = Arc::new(Mutex::new(VecDeque::with_capacity(32)));
+    let args = qemu_launch_args(overlay_image, seed_iso, cpu, memory_mb, ssh_port, None);
+    logs::agent_debug(format!("launching qemu: {binary} {}", shell_join(&args)));
     let mut command = Command::new(binary);
-    command.args(qemu_launch_args(
-        overlay_image,
-        seed_iso,
-        cpu,
-        memory_mb,
-        ssh_port,
-        None,
-    ));
+    command.args(args);
 
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -120,9 +117,21 @@ pub(super) async fn launch_project_qemu(
     network: Option<&VmNetworkLease>,
 ) -> Result<u32> {
     let binary = qemu_binary()?;
+    let args = qemu_launch_args(overlay_image, seed_iso, cpu, memory_mb, ssh_port, network);
+    fs::write(
+        runtime_root.join("qemu.command.txt"),
+        format_qemu_command(binary, &args),
+    )
+    .with_context(|| {
+        format!(
+            "failed to write {}",
+            runtime_root.join("qemu.command.txt").display()
+        )
+    })?;
     let stdout = fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(runtime_root.join("qemu.stdout.log"))
         .with_context(|| {
             format!(
@@ -132,7 +141,8 @@ pub(super) async fn launch_project_qemu(
         })?;
     let stderr = fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(runtime_root.join("qemu.stderr.log"))
         .with_context(|| {
             format!(
@@ -141,14 +151,7 @@ pub(super) async fn launch_project_qemu(
             )
         })?;
     let child = Command::new(binary)
-        .args(qemu_launch_args(
-            overlay_image,
-            seed_iso,
-            cpu,
-            memory_mb,
-            ssh_port,
-            network,
-        ))
+        .args(args)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
@@ -206,7 +209,7 @@ pub(super) fn project_qemu_exit_status(runtime_root: &Path) -> Option<String> {
 
 pub(super) fn recent_project_qemu_logs(runtime_root: &Path) -> String {
     let mut logs = Vec::new();
-    for name in ["qemu.stderr.log", "qemu.stdout.log"] {
+    for name in ["qemu.command.txt", "qemu.stderr.log", "qemu.stdout.log"] {
         let path = runtime_root.join(name);
         let Ok(contents) = fs::read_to_string(&path) else {
             continue;
@@ -220,6 +223,30 @@ pub(super) fn recent_project_qemu_logs(runtime_root: &Path) -> String {
     logs.join("\n")
 }
 
+pub(super) fn project_qemu_command(runtime_root: &Path) -> Option<String> {
+    fs::read_to_string(runtime_root.join("qemu.command.txt"))
+        .ok()
+        .map(|command| command.trim().to_string())
+        .filter(|command| !command.is_empty())
+}
+
+pub(super) fn desired_project_qemu_command(
+    overlay_image: &Path,
+    seed_iso: &Path,
+    cpu: u8,
+    memory_mb: u32,
+    ssh_port: u16,
+    network: Option<&VmNetworkLease>,
+) -> Result<String> {
+    let binary = qemu_binary()?;
+    let args = qemu_launch_args(overlay_image, seed_iso, cpu, memory_mb, ssh_port, network);
+    Ok(format_qemu_command(binary, &args).trim().to_string())
+}
+
+fn format_qemu_command(binary: &str, args: &[String]) -> String {
+    format!("{binary} {}\n", shell_join(args))
+}
+
 pub(super) fn qemu_launch_args(
     overlay_image: &Path,
     seed_iso: &Path,
@@ -229,6 +256,19 @@ pub(super) fn qemu_launch_args(
     network: Option<&VmNetworkLease>,
 ) -> Vec<String> {
     let mut args = vec![
+        "-nodefaults".to_string(),
+        "-no-user-config".to_string(),
+        "-machine".to_string(),
+        "q35,usb=off".to_string(),
+        "-cpu".to_string(),
+        "host".to_string(),
+        "-display".to_string(),
+        "none".to_string(),
+        "-vga".to_string(),
+        "none".to_string(),
+        "-serial".to_string(),
+        "stdio".to_string(),
+        "-no-reboot".to_string(),
         "-m".to_string(),
         memory_mb.to_string(),
         "-smp".to_string(),
@@ -238,16 +278,25 @@ pub(super) fn qemu_launch_args(
         "-accel".to_string(),
         "tcg,split-wx=on,thread=multi".to_string(),
         "-drive".to_string(),
-        format!("if=virtio,format=qcow2,file={}", overlay_image.display()),
+        format!(
+            "if=none,id=rootdisk,format=qcow2,file={}",
+            overlay_image.display()
+        ),
+        "-device".to_string(),
+        "virtio-blk-pci,drive=rootdisk,bootindex=0".to_string(),
         "-drive".to_string(),
         format!(
-            "if=virtio,format=raw,file={},media=cdrom",
+            "if=none,id=seed,format=raw,file={},media=cdrom,readonly=on",
             seed_iso.display()
         ),
+        "-device".to_string(),
+        "virtio-blk-pci,drive=seed".to_string(),
+        "-device".to_string(),
+        "virtio-rng-pci".to_string(),
         "-netdev".to_string(),
         format!("user,id=net0,hostfwd=tcp::{}-:22", ssh_port),
         "-device".to_string(),
-        "virtio-net-pci,netdev=net0".to_string(),
+        format!("virtio-net-pci,netdev=net0,mac={HOSTFWD_NET_MAC_ADDRESS}"),
     ];
     if let Some(network) = network {
         args.extend([
@@ -260,7 +309,6 @@ pub(super) fn qemu_launch_args(
             format!("virtio-net-pci,netdev=net1,mac={}", network.mac_address),
         ]);
     }
-    args.push("-nographic".to_string());
     args
 }
 
@@ -322,6 +370,19 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "-nodefaults",
+                "-no-user-config",
+                "-machine",
+                "q35,usb=off",
+                "-cpu",
+                "host",
+                "-display",
+                "none",
+                "-vga",
+                "none",
+                "-serial",
+                "stdio",
+                "-no-reboot",
                 "-m",
                 "2048",
                 "-smp",
@@ -331,14 +392,19 @@ mod tests {
                 "-accel",
                 "tcg,split-wx=on,thread=multi",
                 "-drive",
-                "if=virtio,format=qcow2,file=/tmp/disk.qcow2",
+                "if=none,id=rootdisk,format=qcow2,file=/tmp/disk.qcow2",
+                "-device",
+                "virtio-blk-pci,drive=rootdisk,bootindex=0",
                 "-drive",
-                "if=virtio,format=raw,file=/tmp/seed.iso,media=cdrom",
+                "if=none,id=seed,format=raw,file=/tmp/seed.iso,media=cdrom,readonly=on",
+                "-device",
+                "virtio-blk-pci,drive=seed",
+                "-device",
+                "virtio-rng-pci",
                 "-netdev",
                 "user,id=net0,hostfwd=tcp::2222-:22",
                 "-device",
-                "virtio-net-pci,netdev=net0",
-                "-nographic",
+                "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56",
             ]
             .into_iter()
             .map(String::from)

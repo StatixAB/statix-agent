@@ -6,10 +6,14 @@ use tokio::process::Command as TokioCommand;
 
 use crate::networking::VmNetworkLease;
 
+use super::qemu::HOSTFWD_NET_MAC_ADDRESS;
 use super::util::{
     DEFAULT_SSH_USER, canonical_ubuntu_image_url, image_cache_key, missing_dependency_message,
     safe_path_segment,
 };
+
+const MIN_OVERLAY_VIRTUAL_SIZE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+const MIN_OVERLAY_VIRTUAL_SIZE_ARG: &str = "20G";
 
 pub(super) async fn resolve_base_image(image: &str, runtime_root: &Path) -> Result<PathBuf> {
     let trimmed = image.trim();
@@ -71,6 +75,45 @@ pub(super) async fn create_overlay_disk(base_image: &Path, overlay_image: &Path)
 
     if !status.success() {
         bail!("qemu-img failed to create overlay disk");
+    }
+
+    ensure_overlay_disk_min_size(overlay_image).await?;
+    Ok(())
+}
+
+pub(super) async fn ensure_overlay_disk_min_size(overlay_image: &Path) -> Result<()> {
+    let output = TokioCommand::new("qemu-img")
+        .arg("info")
+        .arg("--output=json")
+        .arg(overlay_image)
+        .output()
+        .await
+        .with_context(|| missing_dependency_message("qemu-img", "qemu-utils"))?;
+
+    if !output.status.success() {
+        bail!("qemu-img failed to inspect overlay disk");
+    }
+
+    let info: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse qemu-img info output")?;
+    let virtual_size = info
+        .get("virtual-size")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if virtual_size >= MIN_OVERLAY_VIRTUAL_SIZE_BYTES {
+        return Ok(());
+    }
+
+    let status = TokioCommand::new("qemu-img")
+        .arg("resize")
+        .arg(overlay_image)
+        .arg(MIN_OVERLAY_VIRTUAL_SIZE_ARG)
+        .status()
+        .await
+        .with_context(|| missing_dependency_message("qemu-img", "qemu-utils"))?;
+
+    if !status.success() {
+        bail!("qemu-img failed to resize overlay disk");
     }
 
     Ok(())
@@ -170,12 +213,8 @@ disable_root: true
     command.arg(seed_iso);
     if let Some(network) = network {
         let network_config = format!(
-            "version: 2\nethernets:\n  statix0:\n    match:\n      macaddress: \"{}\"\n    set-name: statix0\n    addresses:\n      - {}/{}\n    gateway4: {}\n    nameservers:\n      addresses:\n        - {}\n",
-            network.mac_address,
-            network.vm_ip,
-            network.prefix_len,
-            network.gateway,
-            network.gateway
+            "version: 2\nethernets:\n  statix-host:\n    match:\n      macaddress: \"{}\"\n    set-name: statix-host\n    dhcp4: true\n  statix0:\n    match:\n      macaddress: \"{}\"\n    set-name: statix0\n    addresses:\n      - {}/{}\n",
+            HOSTFWD_NET_MAC_ADDRESS, network.mac_address, network.vm_ip, network.prefix_len
         );
         fs::write(&network_config_path, network_config)
             .with_context(|| format!("failed to write {}", network_config_path.display()))?;

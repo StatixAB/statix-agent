@@ -325,7 +325,10 @@ async fn run_agent() -> Result<()> {
     )?;
     logs::agent_info(format!("starting with nodeId: {}", config.node_id));
     if let Err(error) = networking::reconcile_on_start() {
-        logs::agent_warn(format!("networking reconciliation failed: {error:#}"));
+        logs::agent_warn(format!(
+            "networking reconciliation skipped: {}",
+            format_error_chain(&error)
+        ));
     }
     log_verbose(&format!(
         "runtime config: ws={}, api={}, publish={}ms, system-check={}ms",

@@ -1,26 +1,22 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    env, fs,
-    net::Ipv4Addr,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{collections::BTreeSet, env, fs, net::Ipv4Addr, path::Path, process::Command};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::config::agent_state_dir;
+mod commands;
+mod state;
 
-const STATE_VERSION: u32 = 1;
-const DEFAULT_BRIDGE: &str = "statix0";
-const DEFAULT_SUBNET_PREFIX: u8 = 16;
-const DEFAULT_GATEWAY: Ipv4Addr = Ipv4Addr::new(172, 31, 0, 1);
-#[allow(dead_code)]
+use commands::{command_output, delete_link_best_effort, link_exists, run_ip};
+use state::{
+    AgentNetworkState, BridgeState, DEFAULT_GATEWAY, ExposureState, ExposureStatus,
+    HostPortAllocation, ProjectNetworkState, RuleOwner, load_state, proxy_dir, save_state,
+};
+
 const DYNAMIC_PORT_START: u16 = 30_000;
-#[allow(dead_code)]
 const DYNAMIC_PORT_END: u16 = 39_999;
-#[allow(dead_code)]
+
+// Ports statix will never touch
 const RESERVED_PORTS: &[u16] = &[22, 53, 80, 443, 2375, 2376, 5432, 3306, 6379, 6443, 10250];
 
 #[derive(Debug, Clone)]
@@ -28,7 +24,6 @@ pub struct VmNetworkLease {
     pub vm_ip: Ipv4Addr,
     pub tap_name: String,
     pub mac_address: String,
-    pub gateway: Ipv4Addr,
     pub prefix_len: u8,
 }
 
@@ -48,83 +43,12 @@ pub struct ExposureRequest {
     pub project_exposure_allowed: bool,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExposureVisibility {
     Internal,
     Private,
     Public,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum ExposureStatus {
-    Active,
-    Denied,
-    Pending,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct AgentNetworkState {
-    version: u32,
-    bridge: BridgeState,
-    #[serde(default)]
-    projects: BTreeMap<String, ProjectNetworkState>,
-    #[serde(default)]
-    allocated_host_ports: BTreeMap<u16, HostPortAllocation>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct BridgeState {
-    name: String,
-    gateway: Ipv4Addr,
-    prefix_len: u8,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ProjectNetworkState {
-    project_id: String,
-    environment: String,
-    vm_id: String,
-    vm_ip: Ipv4Addr,
-    tap_name: String,
-    mac_address: String,
-    #[serde(default)]
-    reserved: bool,
-    #[serde(default)]
-    exposures: Vec<ExposureState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ExposureState {
-    host: String,
-    target_port: u16,
-    visibility: ExposureVisibility,
-    status: ExposureStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
-    owner: RuleOwner,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct HostPortAllocation {
-    project_key: String,
-    port: u16,
-    protocol: String,
-    owner: RuleOwner,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RuleOwner {
-    owner: String,
-}
-
-impl RuleOwner {
-    fn statix() -> Self {
-        Self {
-            owner: "statix-agent".to_string(),
-        }
-    }
 }
 
 pub fn reconcile_on_start() -> Result<()> {
@@ -174,7 +98,6 @@ pub fn ensure_project_network(
         vm_ip: project.vm_ip,
         tap_name: project.tap_name.clone(),
         mac_address: project.mac_address.clone(),
-        gateway: state.bridge.gateway,
         prefix_len: state.bridge.prefix_len,
     };
     ensure_tap(&state.bridge, &lease.tap_name)?;
@@ -276,44 +199,6 @@ fn evaluate_exposure(
     })
 }
 
-fn load_state() -> Result<AgentNetworkState> {
-    let path = state_path()?;
-    if !path.exists() {
-        return Ok(AgentNetworkState {
-            version: STATE_VERSION,
-            bridge: BridgeState {
-                name: DEFAULT_BRIDGE.to_string(),
-                gateway: DEFAULT_GATEWAY,
-                prefix_len: DEFAULT_SUBNET_PREFIX,
-            },
-            projects: BTreeMap::new(),
-            allocated_host_ports: BTreeMap::new(),
-        });
-    }
-    let data =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&data).with_context(|| format!("failed to parse {}", path.display()))
-}
-
-fn save_state(state: &mut AgentNetworkState) -> Result<()> {
-    state.version = STATE_VERSION;
-    let path = state_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let data = serde_json::to_string_pretty(state)?;
-    fs::write(&path, data).with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn state_path() -> Result<PathBuf> {
-    Ok(agent_state_dir()?.join("networking").join("state.json"))
-}
-
-fn proxy_dir() -> Result<PathBuf> {
-    Ok(agent_state_dir()?.join("networking").join("proxy"))
-}
-
 fn ensure_bridge(bridge: &BridgeState) -> Result<()> {
     if !cfg!(target_os = "linux") {
         bail!("statix microVM bridge networking is supported on Linux only");
@@ -343,9 +228,7 @@ fn ensure_tap(bridge: &BridgeState, tap_name: &str) -> Result<()> {
 
 fn delete_tap(tap_name: &str) {
     if link_exists(tap_name) {
-        let _ = Command::new("ip")
-            .args(["link", "delete", tap_name])
-            .status();
+        delete_link_best_effort(tap_name);
     }
 }
 
@@ -495,35 +378,6 @@ fn collect_port_token(value: &str, ports: &mut BTreeSet<u16>) {
             ports.insert(port);
         }
     }
-}
-
-fn link_exists(name: &str) -> bool {
-    Command::new("ip")
-        .args(["link", "show", "dev", name])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-fn run_ip(args: &[&str]) -> Result<()> {
-    let status = Command::new("ip")
-        .args(args)
-        .status()
-        .context("failed to launch ip command")?;
-    if !status.success() {
-        bail!("ip {} failed with {}", args.join(" "), status);
-    }
-    Ok(())
-}
-
-fn command_output(program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to launch {program}"))?;
-    if !output.status.success() {
-        bail!("{program} {} failed with {}", args.join(" "), output.status);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn project_key(project_id: &str, environment: &str) -> String {

@@ -12,14 +12,19 @@ use super::guest::{
     wait_for_project_guest_ready,
 };
 use super::image::{
-    create_cloud_init_seed, create_overlay_disk, create_workspace_archive, generate_ssh_keypair,
-    resolve_base_image,
+    create_cloud_init_seed, create_overlay_disk, create_workspace_archive,
+    ensure_overlay_disk_min_size, generate_ssh_keypair, resolve_base_image,
 };
-use super::qemu::{launch_project_qemu, launch_qemu, stop_project_qemu_process};
+use super::qemu::{
+    desired_project_qemu_command, launch_project_qemu, launch_qemu, project_qemu_command,
+    stop_project_qemu_process,
+};
 use super::util::{
     DEFAULT_CPU_COUNT, DEFAULT_MEMORY_MB, DEFAULT_SSH_PORT, project_vm_key, project_vm_ssh_port,
     safe_path_segment,
 };
+
+const PROJECT_DISK_GENERATION: &str = "disk-v2";
 
 pub struct MicrovmRunner {
     image: String,
@@ -212,9 +217,37 @@ impl Runner for ProjectMicrovmRunner {
 
         let base_image = resolve_base_image(&self.image, &runtime_root).await?;
         let overlay_image = runtime_root.join("disk.qcow2");
+        let disk_generation_path = runtime_root.join("disk.generation");
+        let disk_generation = fs::read_to_string(&disk_generation_path)
+            .ok()
+            .map(|value| value.trim().to_string());
+        if overlay_image.exists() && disk_generation.as_deref() != Some(PROJECT_DISK_GENERATION) {
+            stop_project_qemu_process(&runtime_root);
+            let backup_image = runtime_root.join(format!("disk.{}.qcow2", PROJECT_DISK_GENERATION));
+            let _ = fs::remove_file(&backup_image);
+            fs::rename(&overlay_image, &backup_image).with_context(|| {
+                format!(
+                    "failed to move existing project microvm disk {} to {}",
+                    overlay_image.display(),
+                    backup_image.display()
+                )
+            })?;
+            emit_job_stderr(
+                ctx,
+                format!(
+                    "backed up previous project microvm disk to {}; creating {} disk",
+                    backup_image.display(),
+                    PROJECT_DISK_GENERATION
+                ),
+            );
+        }
         if !overlay_image.exists() {
             create_overlay_disk(&base_image, &overlay_image).await?;
+        } else if disk_generation.as_deref() != Some(PROJECT_DISK_GENERATION) {
+            ensure_overlay_disk_min_size(&overlay_image).await?;
         }
+        fs::write(&disk_generation_path, PROJECT_DISK_GENERATION)
+            .with_context(|| format!("failed to write {}", disk_generation_path.display()))?;
 
         let ssh_dir = runtime_root.join("ssh");
         fs::create_dir_all(&ssh_dir)
@@ -233,11 +266,29 @@ impl Runner for ProjectMicrovmRunner {
             &ctx.exposure,
         )?;
         let seed_iso = runtime_root.join("seed.iso");
-        create_cloud_init_seed(&seed_iso, &public_key, &vm_key, Some(&network)).await?;
+        let seed_instance_id = format!("{vm_key}-{PROJECT_DISK_GENERATION}");
+        create_cloud_init_seed(&seed_iso, &public_key, &seed_instance_id, Some(&network)).await?;
 
         let cpu = self.cpu.unwrap_or(DEFAULT_CPU_COUNT);
         let memory_mb = self.memory_mb.unwrap_or(DEFAULT_MEMORY_MB);
-        if !guest_ready(ssh_port, &private_key).await {
+        let desired_qemu_command = desired_project_qemu_command(
+            &overlay_image,
+            &seed_iso,
+            cpu,
+            memory_mb,
+            ssh_port,
+            Some(&network),
+        )?;
+        let qemu_command_changed = project_qemu_command(&runtime_root)
+            .is_some_and(|command| command != desired_qemu_command);
+        if qemu_command_changed {
+            emit_job_stderr(
+                ctx,
+                "project microvm qemu command changed; relaunching runtime",
+            );
+        }
+
+        if qemu_command_changed || !guest_ready(ssh_port, &private_key).await {
             stop_project_qemu_process(&runtime_root);
             let pid = launch_project_qemu(
                 &runtime_root,
@@ -256,6 +307,9 @@ impl Runner for ProjectMicrovmRunner {
                     pid, cpu, memory_mb, ssh_port
                 ),
             );
+            if let Some(command) = project_qemu_command(&runtime_root) {
+                emit_job_stderr(ctx, format!("project microvm qemu command: {command}"));
+            }
         }
 
         wait_for_project_guest_ready(
