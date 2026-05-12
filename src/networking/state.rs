@@ -47,6 +47,8 @@ pub(super) struct ProjectNetworkState {
 pub(super) struct ExposureState {
     pub(super) host: String,
     pub(super) target_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) host_port: Option<u16>,
     pub(super) visibility: ExposureVisibility,
     pub(super) status: ExposureStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,11 +64,23 @@ pub(super) enum ExposureStatus {
     Pending,
 }
 
+impl ExposureStatus {
+    pub(super) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Denied => "denied",
+            Self::Pending => "pending",
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct HostPortAllocation {
     pub(super) project_key: String,
     pub(super) port: u16,
     pub(super) protocol: String,
+    #[serde(default)]
+    pub(super) target_port: u16,
     pub(super) owner: RuleOwner,
 }
 

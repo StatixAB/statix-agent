@@ -154,6 +154,7 @@ pub(super) async fn wait_for_project_guest_ready(
 struct ProjectQemuLogCursor {
     stderr_offset: u64,
     stdout_offset: u64,
+    serial_offset: u64,
 }
 
 impl ProjectQemuLogCursor {
@@ -169,6 +170,12 @@ impl ProjectQemuLogCursor {
             &runtime_root.join("qemu.stdout.log"),
             "qemu.stdout",
             self.stdout_offset,
+        );
+        self.serial_offset = emit_new_project_qemu_log_lines(
+            ctx,
+            &runtime_root.join("qemu.serial.log"),
+            "qemu.serial",
+            self.serial_offset,
         );
     }
 }

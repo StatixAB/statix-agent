@@ -8,9 +8,7 @@ mod system_info;
 mod wireguard;
 
 use std::{
-    collections::BTreeMap,
-    collections::VecDeque,
-    collections::hash_map::DefaultHasher,
+    collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher},
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -946,6 +944,13 @@ async fn execute_job(
             } else {
                 command.clone()
             };
+            let systemd_command = project_systemd_command(
+                project_id,
+                environment,
+                &env_command(&command, &command_env),
+                timeout_seconds,
+                &exposure,
+            );
 
             jobs::execute(
                 &runner_environment,
@@ -957,11 +962,7 @@ async fn execute_job(
                     exposure,
                 },
                 &workspace,
-                &project_systemd_command(
-                    project_id,
-                    environment,
-                    &env_command(&command, &command_env),
-                ),
+                &systemd_command,
             )
             .await
         }
@@ -984,29 +985,87 @@ async fn execute_job(
     }
 }
 
-fn project_systemd_command(project_id: &str, environment: &str, command: &[String]) -> Vec<String> {
+fn project_systemd_command(
+    project_id: &str,
+    environment: &str,
+    command: &[String],
+    timeout_seconds: u64,
+    exposure: &[networking::ExposureRequest],
+) -> Vec<String> {
     let unit_name = format!(
         "statix-project-{}-{}.service",
         safe_path_segment(project_id),
         safe_path_segment(environment)
     );
+    let script_path = format!("/home/statix/.statix/services/{}.sh", unit_name);
     let command = shell_join(command);
-    let service = format!(
-        "[Unit]\nDescription=Statix project {project_id} ({environment})\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser={user}\nWorkingDirectory=/home/{user}/workspace\nEnvironment=HOME=/home/{user}\nExecStart=/bin/bash -lc {command}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+    let script = format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\ncd /home/{user}/workspace\nexec {command}\n",
         user = "statix",
-        command = shell_escape(&command)
+        command = command
     );
+    let service = format!(
+        "[Unit]\nDescription=Statix project {project_id} ({environment})\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser={user}\nWorkingDirectory=/home/{user}/workspace\nEnvironment=HOME=/home/{user}\nExecStart={script_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        user = "statix",
+        script_path = script_path
+    );
+    let readiness_command =
+        project_service_readiness_command(&unit_name, timeout_seconds, exposure);
     vec![
         "bash".to_string(),
         "-lc".to_string(),
         format!(
-            "printf %s {} | sudo tee /etc/systemd/system/{} >/dev/null && sudo systemctl daemon-reload && sudo systemctl enable --now {} && sudo systemctl restart {}",
+            "sudo install -d -o statix -g statix /home/statix/.statix/services && printf %s {} | sudo tee {} >/dev/null && sudo chown statix:statix {} && sudo chmod 0755 {} && printf %s {} | sudo tee /etc/systemd/system/{} >/dev/null && sudo systemctl daemon-reload && sudo systemctl enable {} && sudo systemctl restart {} && {}",
+            shell_escape(&script),
+            shell_escape(&script_path),
+            shell_escape(&script_path),
+            shell_escape(&script_path),
             shell_escape(&service),
             shell_escape(&unit_name),
             shell_escape(&unit_name),
-            shell_escape(&unit_name)
+            shell_escape(&unit_name),
+            readiness_command
         ),
     ]
+}
+
+fn project_service_readiness_command(
+    unit_name: &str,
+    timeout_seconds: u64,
+    exposure: &[networking::ExposureRequest],
+) -> String {
+    let unit = shell_escape(unit_name);
+    let failure_report = format!(
+        "sudo systemctl --no-pager --full status {unit} || true; sudo journalctl -u {unit} -n 120 --no-pager || true"
+    );
+    let target_ports = exposure
+        .iter()
+        .map(|request| request.target_port)
+        .collect::<BTreeSet<_>>();
+
+    if target_ports.is_empty() {
+        return format!(
+            "sleep 2 && sudo systemctl --quiet is-active {unit} || ({failure_report}; exit 1)"
+        );
+    }
+
+    let port_checks = target_ports
+        .iter()
+        .map(|port| format!("(: >/dev/tcp/127.0.0.1/{port}) >/dev/null 2>&1"))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let ports = target_ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "deadline=$((SECONDS + {timeout_seconds})); while true; do if ! sudo systemctl --quiet is-active {unit}; then {failure_report}; exit 1; fi; if {port_checks}; then break; fi; if [ \"$SECONDS\" -ge \"$deadline\" ]; then echo {} >&2; {failure_report}; exit 1; fi; sleep 1; done",
+        shell_escape(&format!(
+            "timed out waiting for deployment port(s): {ports}"
+        ))
+    )
 }
 
 fn default_project_exposure_allowed() -> bool {

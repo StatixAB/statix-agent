@@ -117,7 +117,15 @@ pub(super) async fn launch_project_qemu(
     network: Option<&VmNetworkLease>,
 ) -> Result<u32> {
     let binary = qemu_binary()?;
-    let args = qemu_launch_args(overlay_image, seed_iso, cpu, memory_mb, ssh_port, network);
+    let args = project_qemu_launch_args(
+        runtime_root,
+        overlay_image,
+        seed_iso,
+        cpu,
+        memory_mb,
+        ssh_port,
+        network,
+    );
     fs::write(
         runtime_root.join("qemu.command.txt"),
         format_qemu_command(binary, &args),
@@ -151,7 +159,8 @@ pub(super) async fn launch_project_qemu(
             )
         })?;
     let child = Command::new(binary)
-        .args(args)
+        .args(&args)
+        .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
@@ -181,19 +190,35 @@ pub(super) fn stop_project_qemu_process(runtime_root: &Path) {
     let _ = fs::remove_file(pid_path);
 }
 
-pub(super) fn remove_stale_project_qemu_pid(runtime_root: &Path) {
-    let pid_path = runtime_root.join("qemu.pid");
-    let Ok(raw_pid) = fs::read_to_string(&pid_path) else {
-        return;
+pub(super) fn stop_project_qemu_process_on_ssh_port(ssh_port: u16) -> usize {
+    let mut stopped = 0;
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return stopped;
     };
-    let Ok(pid) = raw_pid.trim().parse::<u32>() else {
-        let _ = fs::remove_file(pid_path);
-        return;
-    };
-    if process_is_running(pid) {
-        return;
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(pid) = file_name
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if project_qemu_cmdline_uses_ssh_port(&cmdline, ssh_port) && process_is_running(pid) {
+            if Command::new("kill")
+                .arg(pid.to_string())
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                stopped += 1;
+            }
+        }
     }
-    let _ = fs::remove_file(pid_path);
+
+    stopped
 }
 
 pub(super) fn project_qemu_exit_status(runtime_root: &Path) -> Option<String> {
@@ -209,7 +234,12 @@ pub(super) fn project_qemu_exit_status(runtime_root: &Path) -> Option<String> {
 
 pub(super) fn recent_project_qemu_logs(runtime_root: &Path) -> String {
     let mut logs = Vec::new();
-    for name in ["qemu.command.txt", "qemu.stderr.log", "qemu.stdout.log"] {
+    for name in [
+        "qemu.command.txt",
+        "qemu.stderr.log",
+        "qemu.stdout.log",
+        "qemu.serial.log",
+    ] {
         let path = runtime_root.join(name);
         let Ok(contents) = fs::read_to_string(&path) else {
             continue;
@@ -239,12 +269,40 @@ pub(super) fn desired_project_qemu_command(
     network: Option<&VmNetworkLease>,
 ) -> Result<String> {
     let binary = qemu_binary()?;
-    let args = qemu_launch_args(overlay_image, seed_iso, cpu, memory_mb, ssh_port, network);
+    let runtime_root = overlay_image.parent().unwrap_or_else(|| Path::new("."));
+    let args = project_qemu_launch_args(
+        runtime_root,
+        overlay_image,
+        seed_iso,
+        cpu,
+        memory_mb,
+        ssh_port,
+        network,
+    );
     Ok(format_qemu_command(binary, &args).trim().to_string())
 }
 
 fn format_qemu_command(binary: &str, args: &[String]) -> String {
     format!("{binary} {}\n", shell_join(args))
+}
+
+fn project_qemu_cmdline_uses_ssh_port(cmdline: &[u8], ssh_port: u16) -> bool {
+    if cmdline.is_empty() {
+        return false;
+    }
+    let parts = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part))
+        .collect::<Vec<_>>();
+    let Some(program) = parts.first() else {
+        return false;
+    };
+    if !program.contains("qemu-system-") {
+        return false;
+    }
+    let hostfwd = format!("hostfwd=tcp::{ssh_port}-:22");
+    parts.iter().any(|part| part.contains(&hostfwd))
 }
 
 pub(super) fn qemu_launch_args(
@@ -254,6 +312,46 @@ pub(super) fn qemu_launch_args(
     memory_mb: u32,
     ssh_port: u16,
     network: Option<&VmNetworkLease>,
+) -> Vec<String> {
+    qemu_launch_args_with_serial(
+        overlay_image,
+        seed_iso,
+        cpu,
+        memory_mb,
+        ssh_port,
+        network,
+        "stdio",
+    )
+}
+
+fn project_qemu_launch_args(
+    runtime_root: &Path,
+    overlay_image: &Path,
+    seed_iso: &Path,
+    cpu: u8,
+    memory_mb: u32,
+    ssh_port: u16,
+    network: Option<&VmNetworkLease>,
+) -> Vec<String> {
+    qemu_launch_args_with_serial(
+        overlay_image,
+        seed_iso,
+        cpu,
+        memory_mb,
+        ssh_port,
+        network,
+        &format!("file:{}", runtime_root.join("qemu.serial.log").display()),
+    )
+}
+
+fn qemu_launch_args_with_serial(
+    overlay_image: &Path,
+    seed_iso: &Path,
+    cpu: u8,
+    memory_mb: u32,
+    ssh_port: u16,
+    network: Option<&VmNetworkLease>,
+    serial: &str,
 ) -> Vec<String> {
     let mut args = vec![
         "-nodefaults".to_string(),
@@ -267,7 +365,7 @@ pub(super) fn qemu_launch_args(
         "-vga".to_string(),
         "none".to_string(),
         "-serial".to_string(),
-        "stdio".to_string(),
+        serial.to_string(),
         "-no-reboot".to_string(),
         "-m".to_string(),
         memory_mb.to_string(),
@@ -358,7 +456,7 @@ fn log_qemu_exit_status(result: std::io::Result<std::process::ExitStatus>) {
 mod tests {
     use std::path::Path;
 
-    use super::qemu_launch_args;
+    use super::{project_qemu_cmdline_uses_ssh_port, qemu_launch_args};
 
     #[test]
     fn qemu_launch_args_enable_kvm_fallback_and_split_wx_tcg() {
@@ -410,5 +508,20 @@ mod tests {
             .map(String::from)
             .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn project_qemu_cmdline_matches_host_forwarded_ssh_port() {
+        let cmdline = b"qemu-system-x86_64\0-netdev\0user,id=net0,hostfwd=tcp::22534-:22\0";
+
+        assert!(project_qemu_cmdline_uses_ssh_port(cmdline, 22534));
+        assert!(!project_qemu_cmdline_uses_ssh_port(cmdline, 22535));
+    }
+
+    #[test]
+    fn project_qemu_cmdline_ignores_non_qemu_processes() {
+        let cmdline = b"ssh\0-netdev\0user,id=net0,hostfwd=tcp::22534-:22\0";
+
+        assert!(!project_qemu_cmdline_uses_ssh_port(cmdline, 22534));
     }
 }

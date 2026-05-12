@@ -17,7 +17,7 @@ use super::image::{
 };
 use super::qemu::{
     desired_project_qemu_command, launch_project_qemu, launch_qemu, project_qemu_command,
-    stop_project_qemu_process,
+    stop_project_qemu_process, stop_project_qemu_process_on_ssh_port,
 };
 use super::util::{
     DEFAULT_CPU_COUNT, DEFAULT_MEMORY_MB, DEFAULT_SSH_PORT, project_vm_key, project_vm_ssh_port,
@@ -204,6 +204,7 @@ impl Runner for ProjectMicrovmRunner {
             .join("microvm")
             .join("projects")
             .join(&vm_key);
+        let runtime_root_was_missing = !runtime_root.exists();
         fs::create_dir_all(&runtime_root)
             .with_context(|| format!("failed to create {}", runtime_root.display()))?;
         emit_job_stderr(
@@ -259,12 +260,37 @@ impl Runner for ProjectMicrovmRunner {
         }
 
         let ssh_port = project_vm_ssh_port(&vm_key);
+        if runtime_root_was_missing {
+            let stopped = stop_project_qemu_process_on_ssh_port(ssh_port);
+            if stopped > 0 {
+                emit_job_stderr(
+                    ctx,
+                    format!(
+                        "stopped {stopped} orphaned project microvm process(es) on ssh port {ssh_port}"
+                    ),
+                );
+            }
+        }
         let network = networking::ensure_project_network(
             &self.project_id,
             &self.environment,
             &vm_key,
             &ctx.exposure,
         )?;
+        emit_job_stderr(
+            ctx,
+            format!(
+                "project microvm network: vm_ip={}/{} tap={} mac={} ssh=127.0.0.1:{}",
+                network.vm_ip, network.prefix_len, network.tap_name, network.mac_address, ssh_port
+            ),
+        );
+        let routes = networking::project_route_descriptions(&self.project_id, &self.environment)?;
+        if routes.is_empty() {
+            emit_job_stderr(ctx, "project microvm routes: no exposures requested");
+        }
+        for route in routes {
+            emit_job_stderr(ctx, format!("project microvm route: {route}"));
+        }
         let seed_iso = runtime_root.join("seed.iso");
         let seed_instance_id = format!("{vm_key}-{PROJECT_DISK_GENERATION}");
         create_cloud_init_seed(&seed_iso, &public_key, &seed_instance_id, Some(&network)).await?;
@@ -290,6 +316,15 @@ impl Runner for ProjectMicrovmRunner {
 
         if qemu_command_changed || !guest_ready(ssh_port, &private_key).await {
             stop_project_qemu_process(&runtime_root);
+            let stopped = stop_project_qemu_process_on_ssh_port(ssh_port);
+            if stopped > 0 {
+                emit_job_stderr(
+                    ctx,
+                    format!(
+                        "stopped {stopped} orphaned project microvm process(es) on ssh port {ssh_port}"
+                    ),
+                );
+            }
             let pid = launch_project_qemu(
                 &runtime_root,
                 &overlay_image,

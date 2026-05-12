@@ -112,6 +112,7 @@ install_dependencies() {
   apt-get update
   apt-get install -y --no-install-recommends \
     ca-certificates \
+    caddy \
     curl \
     cloud-image-utils \
     iproute2 \

@@ -6,7 +6,7 @@ use crate::jobs::{JobExecutionResult, summarize_command_output};
 use crate::networking;
 
 use super::guest::{guest_ready, run_ssh_command};
-use super::qemu::{remove_stale_project_qemu_pid, stop_project_qemu_process};
+use super::qemu::{stop_project_qemu_process, stop_project_qemu_process_on_ssh_port};
 use super::util::{project_vm_key, project_vm_ssh_port, safe_path_segment, shell_join};
 
 pub async fn stop_project_service(
@@ -18,22 +18,34 @@ pub async fn stop_project_service(
         .join("microvm")
         .join("projects")
         .join(&vm_key);
+    let ssh_port = project_vm_ssh_port(&vm_key);
     let private_key = runtime_root.join("ssh").join("id_ed25519");
     if !private_key.is_file() {
+        let stopped = stop_project_qemu_process_on_ssh_port(ssh_port);
+        let _ = networking::stop_project_network(project_id, environment, false);
+        let message = if stopped > 0 {
+            format!("stopped {stopped} orphaned project microvm process(es) for {vm_key}")
+        } else {
+            format!("project microvm {vm_key} has no SSH key; nothing to stop")
+        };
         return Ok(JobExecutionResult {
             status: "succeeded",
-            message: Some(format!(
-                "project microvm {vm_key} has no SSH key; nothing to stop"
-            )),
+            message: Some(message),
         });
     }
 
-    let ssh_port = project_vm_ssh_port(&vm_key);
     if !guest_ready(ssh_port, &private_key).await {
-        remove_stale_project_qemu_pid(&runtime_root);
+        stop_project_qemu_process(&runtime_root);
+        let stopped = stop_project_qemu_process_on_ssh_port(ssh_port);
+        let _ = networking::stop_project_network(project_id, environment, false);
+        let message = if stopped > 0 {
+            format!("stopped {stopped} project microvm process(es) for {vm_key}")
+        } else {
+            format!("project microvm {vm_key} is not running")
+        };
         return Ok(JobExecutionResult {
             status: "succeeded",
-            message: Some(format!("project microvm {vm_key} is not running")),
+            message: Some(message),
         });
     }
 

@@ -1,8 +1,16 @@
-use std::{collections::BTreeSet, env, fs, net::Ipv4Addr, path::Path, process::Command};
+use std::{
+    collections::{BTreeSet, HashSet},
+    env, fs,
+    net::Ipv4Addr,
+    path::Path,
+    process::Command,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+use crate::logs;
 
 mod commands;
 mod state;
@@ -51,9 +59,20 @@ pub enum ExposureVisibility {
     Public,
 }
 
+impl ExposureVisibility {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::Private => "private",
+            Self::Public => "public",
+        }
+    }
+}
+
 pub fn reconcile_on_start() -> Result<()> {
     let mut state = load_state()?;
     ensure_bridge(&state.bridge)?;
+    ensure_managed_exposure_ports(&mut state)?;
     render_proxy_routes(&state)?;
     save_state(&mut state)
 }
@@ -85,14 +104,32 @@ pub fn ensure_project_network(
     }
     let project = state
         .projects
+        .get(&key)
+        .ok_or_else(|| anyhow!("failed to reserve project network state"))?;
+    let mut project_exposures = exposures
+        .iter()
+        .map(|request| evaluate_exposure(project, request))
+        .collect::<Result<Vec<_>>>()?;
+    let mut active_managed_ports = HashSet::new();
+    for exposure in &mut project_exposures {
+        if exposure.status == ExposureStatus::Active
+            && exposure.visibility != ExposureVisibility::Public
+        {
+            let host_port =
+                allocate_managed_port_for(&mut state, &key, "tcp", exposure.target_port)?;
+            exposure.host_port = Some(host_port);
+            active_managed_ports.insert(("tcp".to_string(), exposure.target_port));
+        }
+    }
+    release_unused_host_ports(&mut state, &key, &active_managed_ports);
+
+    let project = state
+        .projects
         .get_mut(&key)
         .ok_or_else(|| anyhow!("failed to reserve project network state"))?;
     project.vm_id = vm_id.to_string();
     project.reserved = false;
-    project.exposures = exposures
-        .iter()
-        .map(|request| evaluate_exposure(project, request))
-        .collect::<Result<Vec<_>>>()?;
+    project.exposures = project_exposures;
 
     let lease = VmNetworkLease {
         vm_ip: project.vm_ip,
@@ -122,6 +159,44 @@ pub fn stop_project_network(project_id: &str, environment: &str, reserve_ip: boo
     save_state(&mut state)
 }
 
+pub fn project_route_descriptions(project_id: &str, environment: &str) -> Result<Vec<String>> {
+    let state = load_state()?;
+    let key = project_key(project_id, environment);
+    let Some(project) = state.projects.get(&key) else {
+        return Ok(Vec::new());
+    };
+
+    Ok(project
+        .exposures
+        .iter()
+        .map(|exposure| {
+            if exposure.status == ExposureStatus::Active {
+                let bind = exposure_bind(exposure);
+                format!(
+                    "{} exposure: {} -> {}:{}",
+                    exposure.visibility.as_str(),
+                    bind,
+                    project.vm_ip,
+                    exposure.target_port
+                )
+            } else {
+                format!(
+                    "{} exposure for {}:{} is {}{}",
+                    exposure.visibility.as_str(),
+                    project.vm_ip,
+                    exposure.target_port,
+                    exposure.status.as_str(),
+                    exposure
+                        .reason
+                        .as_ref()
+                        .map(|reason| format!(" ({reason})"))
+                        .unwrap_or_default()
+                )
+            }
+        })
+        .collect())
+}
+
 #[allow(dead_code)]
 pub fn allocate_managed_port(project_id: &str, environment: &str, protocol: &str) -> Result<u16> {
     let mut state = load_state()?;
@@ -137,6 +212,7 @@ pub fn allocate_managed_port(project_id: &str, environment: &str, protocol: &str
                 project_key,
                 port,
                 protocol: protocol.to_string(),
+                target_port: 0,
                 owner: RuleOwner::statix(),
             },
         );
@@ -160,10 +236,11 @@ fn evaluate_exposure(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("{}.statix.local", project.project_id));
-    let pending = request
+    let host_missing = request
         .host
         .as_ref()
         .is_none_or(|value| value.trim().is_empty());
+    let pending = request.visibility == ExposureVisibility::Public && host_missing;
 
     let denied_reason = match request.visibility {
         ExposureVisibility::Internal | ExposureVisibility::Private => None,
@@ -182,6 +259,7 @@ fn evaluate_exposure(
     Ok(ExposureState {
         host,
         target_port: request.target_port,
+        host_port: None,
         visibility: request.visibility,
         status: if pending {
             ExposureStatus::Pending
@@ -240,13 +318,12 @@ fn render_proxy_routes(state: &AgentNetworkState) -> Result<()> {
     let mut active_routes = 0usize;
     for project in state.projects.values() {
         for exposure in &project.exposures {
-            if exposure.status == ExposureStatus::Active
-                && exposure.visibility == ExposureVisibility::Public
-            {
+            if exposure.status == ExposureStatus::Active {
                 active_routes += 1;
+                let bind = exposure_bind(exposure);
                 routes.push_str(&format!(
                     "{} {{\n\treverse_proxy {}:{}\n}}\n\n",
-                    exposure.host, project.vm_ip, exposure.target_port
+                    bind, project.vm_ip, exposure.target_port
                 ));
             }
         }
@@ -257,36 +334,157 @@ fn render_proxy_routes(state: &AgentNetworkState) -> Result<()> {
     Ok(())
 }
 
+fn exposure_bind(exposure: &ExposureState) -> String {
+    if exposure.visibility == ExposureVisibility::Public {
+        exposure.host.clone()
+    } else {
+        format!(
+            "127.0.0.1:{}",
+            exposure.host_port.unwrap_or(exposure.target_port)
+        )
+    }
+}
+
+fn allocate_managed_port_for(
+    state: &mut AgentNetworkState,
+    project_key: &str,
+    protocol: &str,
+    target_port: u16,
+) -> Result<u16> {
+    if let Some((port, _)) = state.allocated_host_ports.iter().find(|(_, allocation)| {
+        allocation.project_key == project_key
+            && allocation.protocol == protocol
+            && allocation.target_port == target_port
+    }) {
+        return Ok(*port);
+    }
+
+    let blocked = blocked_ports(state);
+    for port in DYNAMIC_PORT_START..=DYNAMIC_PORT_END {
+        if blocked.contains(&port) {
+            continue;
+        }
+        state.allocated_host_ports.insert(
+            port,
+            HostPortAllocation {
+                project_key: project_key.to_string(),
+                port,
+                protocol: protocol.to_string(),
+                target_port,
+                owner: RuleOwner::statix(),
+            },
+        );
+        return Ok(port);
+    }
+    bail!("no free managed host ports in {DYNAMIC_PORT_START}-{DYNAMIC_PORT_END}")
+}
+
+fn ensure_managed_exposure_ports(state: &mut AgentNetworkState) -> Result<()> {
+    let project_keys = state.projects.keys().cloned().collect::<Vec<_>>();
+
+    for project_key in project_keys {
+        let target_ports = state
+            .projects
+            .get(&project_key)
+            .map(|project| {
+                project
+                    .exposures
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, exposure)| {
+                        if exposure.status == ExposureStatus::Active
+                            && exposure.visibility != ExposureVisibility::Public
+                        {
+                            Some((index, exposure.target_port))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let mut active_managed_ports = HashSet::new();
+        for (index, target_port) in target_ports {
+            let host_port = allocate_managed_port_for(state, &project_key, "tcp", target_port)?;
+            if let Some(project) = state.projects.get_mut(&project_key) {
+                if let Some(exposure) = project.exposures.get_mut(index) {
+                    exposure.host_port = Some(host_port);
+                }
+            }
+            active_managed_ports.insert(("tcp".to_string(), target_port));
+        }
+        release_unused_host_ports(state, &project_key, &active_managed_ports);
+    }
+
+    Ok(())
+}
+
+fn release_unused_host_ports(
+    state: &mut AgentNetworkState,
+    project_key: &str,
+    active_ports: &HashSet<(String, u16)>,
+) {
+    state.allocated_host_ports.retain(|_, allocation| {
+        allocation.project_key != project_key
+            || active_ports.contains(&(allocation.protocol.clone(), allocation.target_port))
+    });
+}
+
 fn reload_caddy_best_effort(caddyfile: &Path, start_if_stopped: bool) {
-    if !Command::new("caddy")
+    match Command::new("caddy")
         .arg("validate")
         .arg("--config")
         .arg(caddyfile)
         .status()
-        .is_ok_and(|status| status.success())
     {
-        return;
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            logs::agent_warn(format!(
+                "caddy config validation failed with {status}; exposure proxy routes were not reloaded"
+            ));
+            return;
+        }
+        Err(error) => {
+            logs::agent_warn(format!(
+                "failed to launch caddy for exposure proxy routes: {error}"
+            ));
+            return;
+        }
     }
 
-    if Command::new("caddy")
+    match Command::new("caddy")
         .arg("reload")
         .arg("--config")
         .arg(caddyfile)
         .status()
-        .is_ok_and(|status| status.success())
     {
-        return;
+        Ok(status) if status.success() => return,
+        Ok(status) => logs::agent_warn(format!(
+            "caddy reload failed with {status}; attempting to start caddy"
+        )),
+        Err(error) => {
+            logs::agent_warn(format!(
+                "failed to launch caddy reload for exposure proxy routes: {error}"
+            ));
+            return;
+        }
     }
 
     if !start_if_stopped {
         return;
     }
 
-    let _ = Command::new("caddy")
+    if let Err(error) = Command::new("caddy")
         .arg("start")
         .arg("--config")
         .arg(caddyfile)
-        .status();
+        .status()
+    {
+        logs::agent_warn(format!(
+            "failed to launch caddy start for exposure proxy routes: {error}"
+        ));
+    }
 }
 
 fn allocate_vm_ip(state: &AgentNetworkState, key: &str) -> Result<Ipv4Addr> {

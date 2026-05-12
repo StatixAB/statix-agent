@@ -82,6 +82,7 @@ install_dependencies() {
   log "installing dependencies"
   pacman -Sy --needed --noconfirm \
     ca-certificates \
+    caddy \
     curl \
     iproute2 \
     pciutils \
