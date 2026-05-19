@@ -122,6 +122,8 @@ install_dependencies() {
     qemu-system-x86 \
     qemu-utils \
     openssh-client \
+    socat \
+    podman \
     uidmap \
     wireguard-tools
 }

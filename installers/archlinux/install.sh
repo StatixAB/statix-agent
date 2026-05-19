@@ -87,6 +87,8 @@ install_dependencies() {
     iproute2 \
     pciutils \
     sudo \
+    socat \
+    podman \
     wireguard-tools
 }
 

@@ -15,6 +15,8 @@ let
     pkgs.cloud-utils
     pkgs.iproute2
     pkgs.openssh
+    pkgs.podman
+    pkgs.socat
     pkgs.qemu-utils
     pkgs.qemu_kvm
   ];
